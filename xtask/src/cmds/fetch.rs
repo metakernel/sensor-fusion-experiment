@@ -1,4 +1,5 @@
 use futures_util::TryStreamExt;
+use crate::auth;
 use gcloud_auth::credentials::CredentialsFile;
 /// The Waymo Open Dataset is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 License.
 
@@ -6,13 +7,13 @@ use gcloud_storage::{self, client::ClientConfig, http::objects::download::Range}
 
 
 // This module contains code to fetch the Waymo Open Dataset from Google Cloud Storage.
-pub struct WodFetchConfig {
+pub struct FetchConfig {
     pub bucket: String,
     pub prefix: Option<String>,
     pub credentials: Option<CredentialsFile>,
 }
 
-impl WodFetchConfig {
+impl FetchConfig {
     pub fn new(bucket: String, prefix: Option<String>, credentials: Option<CredentialsFile>) -> Self {
         Self { bucket, prefix, credentials }
     }
@@ -25,7 +26,7 @@ impl WodFetchConfig {
     }
 }
 
-pub async fn fetch_wod(config: &WodFetchConfig, output_path: &std::path::Path) -> anyhow::Result<()> {
+pub async fn fetch_wod(config: &FetchConfig, output_path: &std::path::Path) -> anyhow::Result<()> {
     
     let cred = CredentialsFile::new().await?;
     let clientConfig = ClientConfig::default().with_credentials(cred);

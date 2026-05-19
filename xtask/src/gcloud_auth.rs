@@ -1,1 +1,0 @@
-use gcloud_auth;
