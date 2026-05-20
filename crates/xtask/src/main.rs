@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use sfx_core::manifest::{
+    DownloadedFileManifest, LatestRun, ProcessedSampleManifest, RawFileManifest, RunIndex,
+    SplitsManifest, read_manifest, write_manifest,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -63,12 +67,85 @@ impl ProjectPaths {
             self.root.join("artifacts/tui_exports"),
         ]
     }
+
+    fn manifest_files(&self) -> Vec<ManifestFile> {
+        vec![
+            ManifestFile::new(".xtask/manifests/raw_files.json", ManifestKind::RawFiles),
+            ManifestFile::new(
+                ".xtask/manifests/downloaded_files.json",
+                ManifestKind::DownloadedFiles,
+            ),
+            ManifestFile::new(
+                ".xtask/manifests/processed_samples.json",
+                ManifestKind::ProcessedSamples,
+            ),
+            ManifestFile::new(".xtask/manifests/splits.json", ManifestKind::Splits),
+            ManifestFile::new(".xtask/runs/run_index.json", ManifestKind::RunIndex),
+            ManifestFile::new(".xtask/runs/latest.json", ManifestKind::LatestRun),
+        ]
+    }
+}
+
+struct ManifestFile {
+    relative: &'static str,
+    kind: ManifestKind,
+}
+
+impl ManifestFile {
+    fn new(relative: &'static str, kind: ManifestKind) -> Self {
+        Self { relative, kind }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ManifestKind {
+    RawFiles,
+    DownloadedFiles,
+    ProcessedSamples,
+    Splits,
+    RunIndex,
+    LatestRun,
+}
+
+impl ManifestKind {
+    fn write_default(self, path: &Path) -> sfx_core::manifest::Result<()> {
+        match self {
+            Self::RawFiles => write_manifest(path, &RawFileManifest::default()),
+            Self::DownloadedFiles => write_manifest(path, &DownloadedFileManifest::default()),
+            Self::ProcessedSamples => write_manifest(path, &ProcessedSampleManifest::default()),
+            Self::Splits => write_manifest(path, &SplitsManifest::default()),
+            Self::RunIndex => write_manifest(path, &RunIndex::default()),
+            Self::LatestRun => write_manifest(path, &LatestRun::default()),
+        }
+    }
+
+    fn validate(self, path: &Path) -> sfx_core::manifest::Result<()> {
+        match self {
+            Self::RawFiles => read_manifest::<RawFileManifest>(path)?.validate(),
+            Self::DownloadedFiles => read_manifest::<DownloadedFileManifest>(path)?.validate(),
+            Self::ProcessedSamples => read_manifest::<ProcessedSampleManifest>(path)?.validate(),
+            Self::Splits => read_manifest::<SplitsManifest>(path)?.validate(),
+            Self::RunIndex => read_manifest::<RunIndex>(path)?.validate(),
+            Self::LatestRun => read_manifest::<LatestRun>(path)?.validate(),
+        }
+    }
 }
 
 fn init(paths: &ProjectPaths) -> Result<()> {
     for dir in paths.local_dirs() {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         println!("ok   {}", display_from_root(&paths.root, &dir));
+    }
+
+    for manifest in paths.manifest_files() {
+        let path = paths.root.join(manifest.relative);
+        if !path.exists() {
+            manifest
+                .kind
+                .write_default(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+        }
+        println!("ok   {}", manifest.relative);
     }
     Ok(())
 }
@@ -85,9 +162,9 @@ fn doctor(paths: &ProjectPaths) -> Result<()> {
         check_path(&paths.root, &dir);
     }
 
-    let config_errors = validate_configs(paths);
-    if config_errors > 0 {
-        anyhow::bail!("{config_errors} config file(s) failed validation");
+    let errors = validate_configs(paths) + validate_manifests(paths);
+    if errors > 0 {
+        anyhow::bail!("{errors} file(s) failed validation");
     }
 
     Ok(())
@@ -118,6 +195,28 @@ fn validate_configs(paths: &ProjectPaths) -> usize {
     errors += check_config("configs/eval.default.toml", || {
         sfx_config::load_evaluation_config(root, "configs/eval.default.toml").map(|_| ())
     });
+
+    errors
+}
+
+fn validate_manifests(paths: &ProjectPaths) -> usize {
+    let mut errors = 0;
+
+    for manifest in paths.manifest_files() {
+        let path = paths.root.join(manifest.relative);
+        if !path.exists() {
+            println!("miss {}", manifest.relative);
+            continue;
+        }
+
+        match manifest.kind.validate(&path) {
+            Ok(()) => println!("ok   {}", manifest.relative),
+            Err(err) => {
+                println!("err  {}: {err}", manifest.relative);
+                errors += 1;
+            }
+        }
+    }
 
     errors
 }

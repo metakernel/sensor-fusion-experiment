@@ -23,6 +23,8 @@ repository = "https://github.com/metakernel/sensor-fusion-experiment"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 sfx-config = { path = "crates/sfx-config" }
+sfx-core = { path = "crates/sfx-core" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
-toml = "0.8"
+toml = "1.1.2+spec-1.1.0"

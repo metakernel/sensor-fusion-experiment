@@ -21,8 +21,8 @@ cargo xtask doctor
 
 ## Command overview
 
-- `cargo xtask init`: create local cache, data, and artifact directories.
-- `cargo xtask doctor`: print project environment status.
+- `cargo xtask init`: create local cache, data, artifact directories, and initial manifest files.
+- `cargo xtask doctor`: print project environment status and validate configuration plus local manifests.
 
 ## License
 

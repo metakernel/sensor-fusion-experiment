@@ -9,3 +9,4 @@ repository.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 sfx-config = { workspace = true }
+sfx-core = { workspace = true }

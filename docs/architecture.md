@@ -20,3 +20,5 @@ Local state is intentionally outside version control:
 - `.xtask/` for cache, credentials, manifests, and run indexes.
 - `data/` for raw and processed datasets.
 - `artifacts/` for checkpoints, metrics, previews, reports, and exports.
+
+Manifest JSON files under `.xtask/` track discovered raw files, downloaded files, processed samples, dataset splits, and run history. They are local state and can be regenerated as the pipeline matures.
