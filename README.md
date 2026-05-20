@@ -12,17 +12,23 @@ This repository must not contain Waymo Open Dataset files, extracted sensor fram
 
 ## Quickstart
 
-The workspace foundation supports project setup and environment checks:
+The workspace foundation supports project setup, environment checks, and local Google Cloud authentication:
 
 ```bash
 cargo xtask init
 cargo xtask doctor
+cargo xtask gcloud auth
+cargo xtask gcloud check
 ```
 
 ## Command overview
 
 - `cargo xtask init`: create local cache, data, artifact directories, and initial manifest files.
 - `cargo xtask doctor`: print project environment status and validate configuration plus local manifests.
+- `cargo xtask gcloud auth`: start Google Cloud application-default login with read-only storage scope and save local credentials.
+- `cargo xtask gcloud check`: verify local credentials can mint an access token.
+- `cargo xtask gcloud whoami`: show the active Cloud SDK account when available.
+- `cargo xtask gcloud logout`: revoke application-default credentials and remove local credential files.
 
 ## License
 

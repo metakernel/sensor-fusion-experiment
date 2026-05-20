@@ -1,3 +1,5 @@
+mod gcloud;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sfx_core::manifest::{
@@ -17,6 +19,18 @@ struct Cli {
 enum Command {
     Init,
     Doctor,
+    Gcloud {
+        #[command(subcommand)]
+        command: GcloudCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum GcloudCommand {
+    Auth,
+    Check,
+    Whoami,
+    Logout,
 }
 
 fn main() -> Result<()> {
@@ -26,11 +40,12 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init => init(&paths),
         Command::Doctor => doctor(&paths),
+        Command::Gcloud { command } => gcloud::run(command, &paths),
     }
 }
 
-struct ProjectPaths {
-    root: PathBuf,
+pub(crate) struct ProjectPaths {
+    pub(crate) root: PathBuf,
 }
 
 impl ProjectPaths {
@@ -82,6 +97,36 @@ impl ProjectPaths {
             ManifestFile::new(".xtask/manifests/splits.json", ManifestKind::Splits),
             ManifestFile::new(".xtask/runs/run_index.json", ManifestKind::RunIndex),
             ManifestFile::new(".xtask/runs/latest.json", ManifestKind::LatestRun),
+        ]
+    }
+
+    fn gcloud_dir(&self) -> PathBuf {
+        self.root.join(".xtask/gcloud")
+    }
+
+    fn gcloud_credentials_path(&self) -> PathBuf {
+        self.gcloud_dir().join("credentials.json")
+    }
+
+    fn gcloud_adc_path(&self) -> PathBuf {
+        self.gcloud_dir()
+            .join("application_default_credentials.json")
+    }
+
+    fn gcloud_auth_state_path(&self) -> PathBuf {
+        self.gcloud_dir().join("auth_state.json")
+    }
+
+    fn gcloud_token_cache_path(&self) -> PathBuf {
+        self.gcloud_dir().join("token_cache.json")
+    }
+
+    fn gcloud_credential_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.gcloud_credentials_path(),
+            self.gcloud_adc_path(),
+            self.gcloud_auth_state_path(),
+            self.gcloud_token_cache_path(),
         ]
     }
 }
@@ -254,7 +299,7 @@ fn check_path(root: &Path, path: &Path) {
     }
 }
 
-fn display_from_root(root: &Path, path: &Path) -> String {
+pub(crate) fn display_from_root(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .display()
