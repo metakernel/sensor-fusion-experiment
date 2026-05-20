@@ -1,6 +1,6 @@
 # Architecture
 
-The project is organized as a Rust workspace with library crates under `crates/` and a single operational binary named `xtask`.
+The project is organized as a Rust workspace with library crates under `crates/` and a single operational binary named `xtask` that uses Rust well used polyfill pattern to orchestrate commands for data preparation, training, evaluation, and reporting. The workspace is designed to be modular and extensible, allowing for clear separation of concerns and easy addition of new functionality as the project evolves.
 
 Current crate layout:
 
