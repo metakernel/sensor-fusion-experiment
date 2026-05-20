@@ -1,0 +1,3 @@
+[model]
+kind = "rgb-only"
+latent_dim = 128

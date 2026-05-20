@@ -1,0 +1,12 @@
+[train]
+run_name = "debug"
+batch_size = 4
+learning_rate = 0.001
+epochs = 3
+seed = 42
+
+[dataset]
+config = "configs/dataset.waymo.small.toml"
+
+[model]
+config = "configs/model.fusion.tiny.toml"

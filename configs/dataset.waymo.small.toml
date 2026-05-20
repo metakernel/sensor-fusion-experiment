@@ -1,0 +1,10 @@
+[dataset]
+name = "waymo-range-rgb-v1"
+raw_dir = "data/raw/waymo"
+processed_dir = "data/processed/waymo-range-rgb-v1"
+rgb_size = [128, 256]
+range_size = [64, 256]
+range_channels = ["range", "intensity"]
+train_ratio = 0.8
+val_ratio = 0.1
+test_ratio = 0.1

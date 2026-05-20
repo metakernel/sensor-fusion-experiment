@@ -1,0 +1,12 @@
+[train]
+run_name = "run_001"
+batch_size = 16
+learning_rate = 0.001
+epochs = 20
+seed = 42
+
+[dataset]
+config = "configs/dataset.waymo.small.toml"
+
+[model]
+config = "configs/model.fusion.tiny.toml"

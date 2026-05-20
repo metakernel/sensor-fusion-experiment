@@ -1,0 +1,4 @@
+[eval]
+split = "test"
+batch_size = 8
+preview_count = 16

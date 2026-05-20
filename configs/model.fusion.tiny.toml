@@ -1,0 +1,4 @@
+[model]
+kind = "fusion"
+latent_dim = 128
+z_modality = 256
