@@ -12,6 +12,8 @@ This repository must not contain Waymo Open Dataset files, extracted sensor fram
 
 ## Quickstart
 
+First start by installing the [Google Cloud SDK](https://docs.cloud.google.com/sdk/docs/install-sdk?hl=fr) and authenticating with `cargo xtask gcloud auth` to enable access to the Waymo Open Dataset on Google Cloud Storage. The `doctor` command will report any missing credentials or configuration issues.
+
 The workspace foundation supports project setup, environment checks, and local Google Cloud authentication:
 
 ```bash
