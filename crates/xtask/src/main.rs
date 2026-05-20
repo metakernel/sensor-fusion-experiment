@@ -85,7 +85,57 @@ fn doctor(paths: &ProjectPaths) -> Result<()> {
         check_path(&paths.root, &dir);
     }
 
+    let config_errors = validate_configs(paths);
+    if config_errors > 0 {
+        anyhow::bail!("{config_errors} config file(s) failed validation");
+    }
+
     Ok(())
+}
+
+fn validate_configs(paths: &ProjectPaths) -> usize {
+    let root = &paths.root;
+    let mut errors = 0;
+
+    errors += check_config("configs/dataset.waymo.small.toml", || {
+        sfx_config::load_dataset_config(root, "configs/dataset.waymo.small.toml").map(|_| ())
+    });
+    errors += check_config("configs/model.range-only.tiny.toml", || {
+        sfx_config::load_model_config(root, "configs/model.range-only.tiny.toml").map(|_| ())
+    });
+    errors += check_config("configs/model.rgb-only.tiny.toml", || {
+        sfx_config::load_model_config(root, "configs/model.rgb-only.tiny.toml").map(|_| ())
+    });
+    errors += check_config("configs/model.fusion.tiny.toml", || {
+        sfx_config::load_model_config(root, "configs/model.fusion.tiny.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.debug.toml", || {
+        sfx_config::load_training_config(root, "configs/train.debug.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.nextai.toml", || {
+        sfx_config::load_training_config(root, "configs/train.nextai.toml").map(|_| ())
+    });
+    errors += check_config("configs/eval.default.toml", || {
+        sfx_config::load_evaluation_config(root, "configs/eval.default.toml").map(|_| ())
+    });
+
+    errors
+}
+
+fn check_config<F>(relative: &str, validate: F) -> usize
+where
+    F: FnOnce() -> sfx_config::Result<()>,
+{
+    match validate() {
+        Ok(()) => {
+            println!("ok   {relative}");
+            0
+        }
+        Err(err) => {
+            println!("err  {relative}: {err}");
+            1
+        }
+    }
 }
 
 fn check_file(root: &Path, relative: &str) {

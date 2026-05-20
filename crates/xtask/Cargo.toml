@@ -8,3 +8,4 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+sfx-config = { workspace = true }

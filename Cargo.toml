@@ -22,3 +22,7 @@ repository = "https://github.com/metakernel/sensor-fusion-experiment"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+sfx-config = { path = "crates/sfx-config" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = "0.8"
