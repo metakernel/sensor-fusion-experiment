@@ -1,5 +1,6 @@
 mod dataset;
 mod gcloud;
+mod train;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -28,6 +29,7 @@ enum Command {
         #[command(subcommand)]
         command: DatasetCommand,
     },
+    Train(TrainArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -139,6 +141,12 @@ pub(crate) struct DatasetPreviewArgs {
     pub(crate) out: PathBuf,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct TrainArgs {
+    #[arg(long, default_value = "configs/train.range-only.toml")]
+    pub(crate) config: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum DatasetSourceSplit {
     Training,
@@ -184,6 +192,7 @@ fn main() -> Result<()> {
         Command::Doctor => doctor(&paths),
         Command::Gcloud { command } => gcloud::run(command, &paths),
         Command::Dataset { command } => dataset::run(command, &paths),
+        Command::Train(args) => train::run(args, &paths),
     }
 }
 
@@ -389,6 +398,12 @@ fn validate_configs(paths: &ProjectPaths) -> usize {
     });
     errors += check_config("configs/model.fusion.tiny.toml", || {
         sfx_config::load_model_config(root, "configs/model.fusion.tiny.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.range-only.toml", || {
+        sfx_config::load_training_config(root, "configs/train.range-only.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.rgb-only.toml", || {
+        sfx_config::load_training_config(root, "configs/train.rgb-only.toml").map(|_| ())
     });
     errors += check_config("configs/train.debug.toml", || {
         sfx_config::load_training_config(root, "configs/train.debug.toml").map(|_| ())

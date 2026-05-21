@@ -11,5 +11,5 @@ burn = ["dep:burn"]
 
 [dependencies]
 anyhow = { workspace = true }
-burn = { version = "0.21.0", default-features = false, features = ["std"], optional = true }
+burn = { workspace = true, optional = true }
 sfx-core = { workspace = true }

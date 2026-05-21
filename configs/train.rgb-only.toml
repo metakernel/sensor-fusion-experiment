@@ -1,0 +1,12 @@
+[train]
+run_name = "rgb_run_001"
+batch_size = 4
+learning_rate = 0.001
+epochs = 3
+seed = 42
+
+[dataset]
+config = "configs/dataset.waymo.small.toml"
+
+[model]
+config = "configs/model.rgb-only.tiny.toml"

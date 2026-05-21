@@ -6,3 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+burn = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sfx-config = { workspace = true }
+sfx-core = { workspace = true }
+sfx-data = { workspace = true, features = ["burn"] }
+sfx-models = { workspace = true }
