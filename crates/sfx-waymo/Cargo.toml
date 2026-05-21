@@ -8,7 +8,5 @@ repository.workspace = true
 [dependencies]
 sfx-core = { workspace = true }
 anyhow = { workspace = true }
-parquet = { version = "58.3.0", default-features = false, features = ["arrow"] }
+parquet = { version = "58.3.0", default-features = false, features = ["arrow", "brotli"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ipc"] }
-flate2 = "1.1.9"
-prost = "0.14.3"

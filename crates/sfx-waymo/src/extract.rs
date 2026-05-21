@@ -1,18 +1,20 @@
 use anyhow::{Context, Result, anyhow};
-use arrow::array::{Array, BinaryArray, Int64Array, Int8Array, LargeBinaryArray, StringArray};
+use arrow::array::{
+    Array, BinaryArray, FixedSizeListArray, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    ListArray, StringArray,
+};
 use arrow::datatypes::{DataType, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 pub const CAMERA_FRONT: i8 = 1;
-pub const LIDAR_TOP: i8 = 1;
+pub const LASER_TOP: i8 = 1;
 
 const COL_SEGMENT: &str = "key.segment_context_name";
 const COL_TIMESTAMP: &str = "key.frame_timestamp_micros";
 const COL_CAMERA_NAME: &str = "key.camera_name";
-const COL_LIDAR_NAME: &str = "key.lidar_name";
+const COL_LASER_NAME: &str = "key.laser_name";
 
 #[derive(Debug, Clone)]
 pub struct SchemaField {
@@ -103,8 +105,10 @@ pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFra
         .with_context(|| format!("reading parquet metadata of {}", path.display()))?;
 
     let schema = builder.schema().clone();
-    let range_col = find_column_containing(&schema, "range_image_return1")
-        .ok_or_else(|| anyhow!("no range_image_return1 column found; schema:\n{}", schema_summary(&schema)))?;
+    let values_col = find_column_containing(&schema, "range_image_return1.values")
+        .ok_or_else(|| anyhow!("no range_image_return1.values column; schema:\n{}", schema_summary(&schema)))?;
+    let shape_col = find_column_containing(&schema, "range_image_return1.shape")
+        .ok_or_else(|| anyhow!("no range_image_return1.shape column; schema:\n{}", schema_summary(&schema)))?;
 
     let reader = builder.build()?;
     let mut frames = Vec::new();
@@ -114,26 +118,28 @@ pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFra
 
         let segments = col_as::<StringArray>(&batch, COL_SEGMENT, "StringArray")?;
         let timestamps = col_as::<Int64Array>(&batch, COL_TIMESTAMP, "Int64Array")?;
-        let lidar_names = col_as::<Int8Array>(&batch, COL_LIDAR_NAME, "Int8Array")?;
+        let laser_names = col_as::<Int8Array>(&batch, COL_LASER_NAME, "Int8Array")?;
 
-        let range_arr = batch.column_by_name(&range_col)
-            .ok_or_else(|| anyhow!("column {range_col} missing in batch"))?;
+        let values_arr = batch.column_by_name(&values_col)
+            .ok_or_else(|| anyhow!("column {values_col} missing in batch"))?;
+        let shape_arr = batch.column_by_name(&shape_col)
+            .ok_or_else(|| anyhow!("column {shape_col} missing in batch"))?;
 
         for i in 0..batch.num_rows() {
-            if lidar_names.value(i) != LIDAR_TOP {
+            if laser_names.value(i) != LASER_TOP {
                 continue;
             }
-            let raw = extract_binary(range_arr, i)
-                .with_context(|| format!("reading range image bytes at row {i}"))?;
 
-            let (range_values, shape) = decode_range_image(&raw)
-                .with_context(|| format!("decoding range image at row {i}"))?;
+            let range_values = extract_float_list(values_arr, i)
+                .with_context(|| format!("reading range values at row {i}"))?;
+            let shape = extract_int32_fixed_list::<3>(shape_arr, i)
+                .with_context(|| format!("reading range shape at row {i}"))?;
 
             frames.push(LidarFrame {
                 segment: segments.value(i).to_string(),
                 timestamp_micros: timestamps.value(i),
                 range_values,
-                shape,
+                shape: [shape[0] as usize, shape[1] as usize, shape[2] as usize],
             });
 
             if max.is_some_and(|m| frames.len() >= m) {
@@ -178,186 +184,37 @@ fn extract_binary(col: &dyn Array, row: usize) -> Result<Vec<u8>> {
     Err(anyhow!("column is not a binary array; type: {:?}", col.data_type()))
 }
 
-fn decode_range_image(bytes: &[u8]) -> Result<(Vec<f32>, [usize; 3])> {
-    // Try parsing as MatrixFloat protobuf (Waymo v2 format)
-    if let Ok((values, dims)) = decode_matrix_float_proto(bytes) {
-        if dims.len() >= 2 {
-            let h = dims[0] as usize;
-            let w = dims[1] as usize;
-            let c = if dims.len() >= 3 { dims[2] as usize } else { values.len() / (h * w).max(1) };
-            return Ok((values, [h, w, c]));
-        }
+/// Extract a row from a List<Float32> column.
+fn extract_float_list(col: &dyn Array, row: usize) -> Result<Vec<f32>> {
+    let list = col.as_any().downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("expected ListArray, got {:?}", col.data_type()))?;
+    if list.is_null(row) {
+        return Ok(Vec::new());
     }
+    let values = list.value(row);
+    let floats = values.as_any().downcast_ref::<arrow::array::Float32Array>()
+        .ok_or_else(|| anyhow!("List element type is not Float32"))?;
+    Ok((0..floats.len()).map(|i| floats.value(i)).collect())
+}
 
-    // Fallback: try zlib-decompressed raw float32
-    let decompressed = if is_zlib(bytes) {
-        decompress_zlib(bytes)?
-    } else {
-        bytes.to_vec()
-    };
-
-    if decompressed.len() % 4 != 0 {
-        anyhow::bail!(
-            "decoded {} bytes, not divisible by 4; cannot interpret as f32 array",
-            decompressed.len()
-        );
+/// Extract a row from a FixedSizeList<Int32, N> column.
+fn extract_int32_fixed_list<const N: usize>(col: &dyn Array, row: usize) -> Result<[i32; N]> {
+    let list = col.as_any().downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| anyhow!("expected FixedSizeListArray, got {:?}", col.data_type()))?;
+    if list.is_null(row) {
+        return Ok([0i32; N]);
     }
-
-    let values: Vec<f32> = decompressed
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-
-    let shape = infer_top_lidar_shape(values.len());
-    Ok((values, shape))
-}
-
-/// Minimal protobuf decoder for Waymo MatrixFloat:
-///   message MatrixFloat { repeated float data = 1; MatrixShape shape = 2; }
-///   message MatrixShape  { repeated int32 dims = 1; }
-fn decode_matrix_float_proto(bytes: &[u8]) -> Result<(Vec<f32>, Vec<i32>)> {
-    let mut pos = 0;
-    let mut data = Vec::new();
-    let mut dims = Vec::new();
-
-    while pos < bytes.len() {
-        let (tag, wire, advance) = read_proto_tag(bytes, pos)?;
-        pos += advance;
-        match (tag, wire) {
-            (1, 2) => {
-                let (len, a) = read_proto_varint(bytes, pos)?;
-                pos += a;
-                let end = pos + len as usize;
-                if end > bytes.len() {
-                    anyhow::bail!("data field overflows buffer");
-                }
-                let slice = &bytes[pos..end];
-                for chunk in slice.chunks_exact(4) {
-                    data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-                }
-                pos = end;
-            }
-            (2, 2) => {
-                let (len, a) = read_proto_varint(bytes, pos)?;
-                pos += a;
-                let end = pos + len as usize;
-                if end > bytes.len() {
-                    anyhow::bail!("shape field overflows buffer");
-                }
-                dims = decode_matrix_shape_proto(&bytes[pos..end])?;
-                pos = end;
-            }
-            (_, 0) => {
-                let (_, a) = read_proto_varint(bytes, pos)?;
-                pos += a;
-            }
-            (_, 2) => {
-                let (len, a) = read_proto_varint(bytes, pos)?;
-                pos += a + len as usize;
-            }
-            (_, 5) => {
-                pos += 4;
-            }
-            (_, 1) => {
-                pos += 8;
-            }
-            (_, wt) => anyhow::bail!("unknown wire type {wt}"),
-        }
+    let values = list.value(row);
+    let ints = values.as_any().downcast_ref::<Int32Array>()
+        .ok_or_else(|| anyhow!("FixedSizeList element type is not Int32"))?;
+    if ints.len() < N {
+        anyhow::bail!("FixedSizeList has {} elements, expected {}", ints.len(), N);
     }
-
-    Ok((data, dims))
-}
-
-fn decode_matrix_shape_proto(bytes: &[u8]) -> Result<Vec<i32>> {
-    let mut pos = 0;
-    let mut dims = Vec::new();
-    while pos < bytes.len() {
-        let (tag, wire, advance) = read_proto_tag(bytes, pos)?;
-        pos += advance;
-        match (tag, wire) {
-            (1, 0) => {
-                let (v, a) = read_proto_varint(bytes, pos)?;
-                dims.push(v as i32);
-                pos += a;
-            }
-            (1, 2) => {
-                // packed int32 dims
-                let (len, a) = read_proto_varint(bytes, pos)?;
-                pos += a;
-                let end = pos + len as usize;
-                while pos < end {
-                    let (v, a) = read_proto_varint(bytes, pos)?;
-                    dims.push(v as i32);
-                    pos += a;
-                }
-            }
-            (_, 0) => {
-                let (_, a) = read_proto_varint(bytes, pos)?;
-                pos += a;
-            }
-            (_, 2) => {
-                let (len, a) = read_proto_varint(bytes, pos)?;
-                pos += a + len as usize;
-            }
-            (_, wt) => anyhow::bail!("unknown wire type {wt} in shape"),
-        }
+    let mut out = [0i32; N];
+    for (i, v) in out.iter_mut().enumerate() {
+        *v = ints.value(i);
     }
-    Ok(dims)
-}
-
-fn read_proto_tag(bytes: &[u8], pos: usize) -> Result<(u64, u8, usize)> {
-    let (v, advance) = read_proto_varint(bytes, pos)?;
-    let field = v >> 3;
-    let wire = (v & 0x7) as u8;
-    Ok((field, wire, advance))
-}
-
-fn read_proto_varint(bytes: &[u8], mut pos: usize) -> Result<(u64, usize)> {
-    let start = pos;
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    loop {
-        if pos >= bytes.len() {
-            anyhow::bail!("varint overflows buffer at {pos}");
-        }
-        let b = bytes[pos] as u64;
-        pos += 1;
-        value |= (b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift >= 64 {
-            anyhow::bail!("varint too long");
-        }
-    }
-    Ok((value, pos - start))
-}
-
-fn is_zlib(bytes: &[u8]) -> bool {
-    bytes.len() >= 2
-        && bytes[0] == 0x78
-        && matches!(bytes[1], 0x01 | 0x5e | 0x9c | 0xda)
-}
-
-fn decompress_zlib(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = flate2::read::ZlibDecoder::new(bytes);
-    let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
-        .context("decompressing zlib range image")?;
     Ok(out)
-}
-
-fn infer_top_lidar_shape(n: usize) -> [usize; 3] {
-    const TOP_H: usize = 64;
-    const TOP_W: usize = 2650;
-    const CHANNELS: usize = 4;
-    if n == TOP_H * TOP_W * CHANNELS {
-        [TOP_H, TOP_W, CHANNELS]
-    } else {
-        [n, 1, 1]
-    }
 }
 
 fn schema_summary(schema: &SchemaRef) -> String {

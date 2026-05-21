@@ -535,7 +535,17 @@ fn print_selection_warnings(args: &DatasetFetchArgs, selected: &[RawFileEntry]) 
 }
 
 fn target_path_for_raw(out_dir: &Path, file: &RawFileEntry) -> PathBuf {
-    out_dir.join(split_label(&file.split)).join(&file.file_name)
+    // URI: gs://bucket/split/component/file.parquet — include component subdir
+    let parts: Vec<&str> = file.uri.splitn(6, '/').collect();
+    if parts.len() == 6 {
+        let component = parts[4];
+        out_dir
+            .join(split_label(&file.split))
+            .join(component)
+            .join(&file.file_name)
+    } else {
+        out_dir.join(split_label(&file.split)).join(&file.file_name)
+    }
 }
 
 fn download_raw_file(
