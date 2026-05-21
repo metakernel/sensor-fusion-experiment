@@ -1,9 +1,18 @@
 use anyhow::{Context, Result};
+use image::imageops::FilterType;
 use sfx_core::manifest::{
     MultimodalSampleMeta, ProcessedSampleEntry, SampleId, Split,
 };
 use sfx_waymo::extract::{CameraFrame, LidarFrame};
 use std::path::{Path, PathBuf};
+
+pub const RGB_H: usize = 128;
+pub const RGB_W: usize = 256;
+pub const RANGE_H: usize = 64;
+pub const RANGE_W: usize = 256;
+pub const RANGE_CHANNELS: usize = 2;
+/// Physical max range in metres used for normalisation.
+const MAX_RANGE_METERS: f32 = 75.0;
 
 pub struct ExtractedPair {
     pub segment: String,
@@ -50,27 +59,30 @@ pub fn write_sample(
     std::fs::create_dir_all(&sample_dir)
         .with_context(|| format!("creating {}", sample_dir.display()))?;
 
-    let rgb_path = sample_dir.join("rgb.jpg");
+    let rgb_path = sample_dir.join("rgb.f32.bin");
     let range_path = sample_dir.join("range.f32.bin");
     let meta_path = sample_dir.join("meta.json");
-    let preview_rgb_path = sample_dir.join("preview_rgb.jpg");
+    let preview_rgb_path = sample_dir.join("preview_rgb.png");
     let preview_range_path = sample_dir.join("preview_range.png");
 
-    std::fs::write(&rgb_path, &pair.jpeg_bytes)
+    // --- RGB: decode JPEG → resize [H, W] → normalise → CHW f32 binary ---
+    let rgb_chw = process_rgb(&pair.jpeg_bytes, RGB_H, RGB_W)
+        .context("processing RGB frame")?;
+    let rgb_bytes: Vec<u8> = rgb_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
+    std::fs::write(&rgb_path, &rgb_bytes)
         .with_context(|| format!("writing {}", rgb_path.display()))?;
 
-    std::fs::copy(&rgb_path, &preview_rgb_path)
+    write_rgb_preview(&rgb_chw, RGB_H, RGB_W, &preview_rgb_path)
         .with_context(|| format!("writing {}", preview_rgb_path.display()))?;
 
-    let range_bytes: Vec<u8> = pair
-        .range_values
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
+    // --- Range: extract channels [0,1] → resize width → normalise → CHW f32 binary ---
+    let range_chw = process_range(&pair.range_values, &pair.range_shape, RANGE_H, RANGE_W)
+        .context("processing range frame")?;
+    let range_bytes: Vec<u8> = range_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&range_path, &range_bytes)
         .with_context(|| format!("writing {}", range_path.display()))?;
 
-    write_range_preview(&pair.range_values, &pair.range_shape, &preview_range_path)
+    write_range_preview(&range_chw, RANGE_H, RANGE_W, &preview_range_path)
         .with_context(|| format!("writing {}", preview_range_path.display()))?;
 
     let meta = MultimodalSampleMeta {
@@ -93,42 +105,110 @@ pub fn write_sample(
     })
 }
 
-fn write_range_preview(values: &[f32], shape: &[usize; 3], path: &Path) -> Result<()> {
-    let [h, w, c] = *shape;
-    if h == 0 || w == 0 || c == 0 {
-        anyhow::bail!("invalid range image shape {h}×{w}×{c}");
+/// Decode JPEG → resize to `[H, W]` → normalise to `[0, 1]` → CHW layout `[3, H, W]`.
+fn process_rgb(jpeg: &[u8], h: usize, w: usize) -> Result<Vec<f32>> {
+    let img = image::load_from_memory(jpeg).context("decoding JPEG")?;
+    let resized = img.resize_exact(w as u32, h as u32, FilterType::Triangle);
+    let rgb8 = resized.to_rgb8();
+
+    let pixels = rgb8.as_raw();
+    let num = h * w;
+    let mut chw = vec![0.0f32; 3 * num];
+
+    for i in 0..num {
+        chw[i] = pixels[3 * i] as f32 / 255.0;
+        chw[num + i] = pixels[3 * i + 1] as f32 / 255.0;
+        chw[2 * num + i] = pixels[3 * i + 2] as f32 / 255.0;
     }
 
-    let channel: Vec<f32> = (0..h * w)
-        .map(|i| {
-            let idx = i * c;
-            values.get(idx).copied().unwrap_or(0.0)
-        })
-        .collect();
+    Ok(chw)
+}
 
-    let valid: Vec<f32> = channel
+/// Extract channels `[0, 1]` from raw LiDAR range image `[H_src, W_src, C_src]`,
+/// resize width to `W_target`, normalise, return CHW `[2, H, W]`.
+fn process_range(values: &[f32], shape: &[usize; 3], h: usize, w: usize) -> Result<Vec<f32>> {
+    let [h_src, w_src, c_src] = *shape;
+    if h_src == 0 || w_src == 0 || c_src == 0 {
+        anyhow::bail!("invalid range shape {h_src}×{w_src}×{c_src}");
+    }
+    if h_src != h {
+        anyhow::bail!("range height {h_src} != expected {h}");
+    }
+    if c_src < 2 {
+        anyhow::bail!("range image has only {c_src} channel(s); need at least 2");
+    }
+
+    // Bilinear resize in width dimension only (height already matches).
+    let scale = w_src as f32 / w as f32;
+    let mut ch0 = vec![0.0f32; h * w]; // range / distance
+    let mut ch1 = vec![0.0f32; h * w]; // intensity
+
+    for row in 0..h {
+        for col in 0..w {
+            let src_x = (col as f32 + 0.5) * scale - 0.5;
+            let x0 = (src_x.floor() as isize).clamp(0, w_src as isize - 1) as usize;
+            let x1 = (x0 + 1).min(w_src - 1);
+            let t = (src_x - x0 as f32).clamp(0.0, 1.0);
+
+            let i0 = (row * w_src + x0) * c_src;
+            let i1 = (row * w_src + x1) * c_src;
+            let r0 = values.get(i0).copied().unwrap_or(0.0);
+            let r1 = values.get(i1).copied().unwrap_or(0.0);
+            let intensity0 = values.get(i0 + 1).copied().unwrap_or(0.0);
+            let intensity1 = values.get(i1 + 1).copied().unwrap_or(0.0);
+
+            ch0[row * w + col] = r0 + t * (r1 - r0);
+            ch1[row * w + col] = intensity0 + t * (intensity1 - intensity0);
+        }
+    }
+
+    // Normalise channel 0: divide by physical max range, clamp to [0, 1]
+    for v in &mut ch0 {
+        *v = (*v / MAX_RANGE_METERS).clamp(0.0, 1.0);
+    }
+
+    // Normalise channel 1 (intensity): to [0, 1] by observed max
+    let int_max = ch1.iter().cloned().fold(0.0f32, f32::max);
+    if int_max > 0.0 {
+        for v in &mut ch1 {
+            *v = (*v / int_max).clamp(0.0, 1.0);
+        }
+    }
+
+    // Pack as CHW: [2, H, W]
+    let mut chw = Vec::with_capacity(2 * h * w);
+    chw.extend_from_slice(&ch0);
+    chw.extend_from_slice(&ch1);
+    Ok(chw)
+}
+
+/// Save the processed CHW RGB tensor (already f32 [0,1]) as a PNG preview.
+fn write_rgb_preview(chw: &[f32], h: usize, w: usize, path: &Path) -> Result<()> {
+    let num = h * w;
+    let mut pixels = vec![0u8; 3 * num];
+    for i in 0..num {
+        pixels[3 * i] = (chw[i].clamp(0.0, 1.0) * 255.0) as u8;
+        pixels[3 * i + 1] = (chw[num + i].clamp(0.0, 1.0) * 255.0) as u8;
+        pixels[3 * i + 2] = (chw[2 * num + i].clamp(0.0, 1.0) * 255.0) as u8;
+    }
+    let img = image::RgbImage::from_raw(w as u32, h as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("failed to create RGB preview image"))?;
+    img.save(path)
+        .with_context(|| format!("saving RGB preview to {}", path.display()))?;
+    Ok(())
+}
+
+/// Save channel 0 of the processed CHW range tensor as a grayscale PNG preview.
+fn write_range_preview(chw: &[f32], h: usize, w: usize, path: &Path) -> Result<()> {
+    let ch0 = &chw[..h * w]; // channel 0 already normalised to [0, 1]
+    let pixels: Vec<u8> = ch0
         .iter()
-        .filter(|&&v| v > 0.0 && v.is_finite())
-        .copied()
+        .map(|&v| (v.clamp(0.0, 1.0) * 255.0) as u8)
         .collect();
-    let max_val = valid.iter().cloned().fold(0.0f32, f32::max).max(1.0);
-
-    let pixels: Vec<u8> = channel
-        .iter()
-        .map(|&v| {
-            if v > 0.0 && v.is_finite() {
-                ((v / max_val).clamp(0.0, 1.0) * 255.0) as u8
-            } else {
-                0
-            }
-        })
-        .collect();
-
     let img = image::GrayImage::from_raw(w as u32, h as u32, pixels)
         .ok_or_else(|| anyhow::anyhow!("failed to create range preview image"))?;
     img.save(path)
         .with_context(|| format!("saving range preview to {}", path.display()))?;
-
     Ok(())
 }
 

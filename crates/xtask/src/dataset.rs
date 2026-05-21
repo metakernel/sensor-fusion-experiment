@@ -324,8 +324,16 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
     let sample_manifest = ProcessedSampleManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         dataset: Some(dataset_config.name.clone()),
-        rgb_shape: None,
-        range_shape: None,
+        rgb_shape: Some(sfx_core::manifest::TensorShape {
+            channels: 3,
+            height: sfx_preprocess::RGB_H,
+            width: sfx_preprocess::RGB_W,
+        }),
+        range_shape: Some(sfx_core::manifest::TensorShape {
+            channels: sfx_preprocess::RANGE_CHANNELS,
+            height: sfx_preprocess::RANGE_H,
+            width: sfx_preprocess::RANGE_W,
+        }),
         samples: all_entries,
     };
     sample_manifest.validate()?;
