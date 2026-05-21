@@ -41,6 +41,7 @@ pub(crate) enum GcloudCommand {
 #[derive(Subcommand, Debug)]
 pub(crate) enum DatasetCommand {
     List(DatasetListArgs),
+    Fetch(DatasetFetchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -63,7 +64,29 @@ pub(crate) struct DatasetListArgs {
     pub(crate) dry_run: bool,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Args, Debug)]
+pub(crate) struct DatasetFetchArgs {
+    #[arg(long, default_value = "waymo")]
+    pub(crate) dataset: String,
+    #[arg(long, value_delimiter = ',', value_parser = parse_dataset_source_split, default_value = "train,val")]
+    pub(crate) splits: Vec<DatasetSourceSplit>,
+    #[arg(long, default_value_t = 1)]
+    pub(crate) train_files: usize,
+    #[arg(long, default_value_t = 1)]
+    pub(crate) val_files: usize,
+    #[arg(long, default_value_t = 1)]
+    pub(crate) test_files: usize,
+    #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
+    pub(crate) config: PathBuf,
+    #[arg(long)]
+    pub(crate) manifest: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum DatasetSourceSplit {
     Training,
     Validation,
@@ -77,6 +100,21 @@ impl From<DatasetSourceSplit> for SourceSplit {
             DatasetSourceSplit::Validation => Self::Validation,
             DatasetSourceSplit::Testing => Self::Testing,
         }
+    }
+}
+
+pub(crate) fn gcloud_exe() -> &'static str {
+    if cfg!(windows) { "gcloud.cmd" } else { "gcloud" }
+}
+
+fn parse_dataset_source_split(value: &str) -> std::result::Result<DatasetSourceSplit, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "train" | "training" => Ok(DatasetSourceSplit::Training),
+        "val" | "valid" | "validation" => Ok(DatasetSourceSplit::Validation),
+        "test" | "testing" => Ok(DatasetSourceSplit::Testing),
+        other => Err(format!(
+            "unsupported split {other}; expected train, val, or test"
+        )),
     }
 }
 
@@ -180,6 +218,10 @@ impl ProjectPaths {
 
     fn raw_file_manifest_path(&self) -> PathBuf {
         self.root.join(".xtask/manifests/raw_files.json")
+    }
+
+    fn downloaded_file_manifest_path(&self) -> PathBuf {
+        self.root.join(".xtask/manifests/downloaded_files.json")
     }
 }
 

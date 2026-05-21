@@ -22,6 +22,7 @@ cargo xtask doctor
 cargo xtask gcloud auth
 cargo xtask gcloud check
 cargo xtask dataset list --split training --limit 20
+cargo xtask dataset fetch --splits train,val --train-files 1 --val-files 1
 ```
 
 ## Command overview
@@ -33,6 +34,7 @@ cargo xtask dataset list --split training --limit 20
 - `cargo xtask gcloud whoami`: show the active Cloud SDK account when available.
 - `cargo xtask gcloud logout`: revoke application-default credentials and remove local credential files.
 - `cargo xtask dataset list`: list Waymo Cloud Storage objects for one source split and write `.xtask/manifests/raw_files.json`.
+- `cargo xtask dataset fetch`: download selected Waymo objects into split-specific raw data folders and write `.xtask/manifests/downloaded_files.json`.
 
 ## License
 

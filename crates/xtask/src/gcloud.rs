@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
 
 const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 #[derive(Serialize)]
 struct AuthState {
@@ -27,7 +28,7 @@ fn auth(paths: &ProjectPaths) -> Result<()> {
     ensure_gcloud_dir(paths)?;
     ensure_gcloud_available()?;
 
-    let scope_arg = format!("--scopes={STORAGE_SCOPE}");
+    let scope_arg = format!("--scopes={CLOUD_PLATFORM_SCOPE},{STORAGE_SCOPE}");
     let mut command = local_gcloud_command(paths);
     command
         .args(["auth", "application-default", "login"])
@@ -123,7 +124,7 @@ fn ensure_gcloud_dir(paths: &ProjectPaths) -> Result<()> {
 }
 
 fn ensure_gcloud_available() -> Result<()> {
-    let output = ProcessCommand::new("gcloud")
+    let output = ProcessCommand::new(crate::gcloud_exe())
         .arg("--version")
         .output()
         .with_context(|| "running `gcloud --version`; install the Google Cloud CLI and make sure it is on PATH")?;
@@ -142,7 +143,7 @@ fn ensure_gcloud_available() -> Result<()> {
 }
 
 fn gcloud_available() -> bool {
-    ProcessCommand::new("gcloud")
+    ProcessCommand::new(crate::gcloud_exe())
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -150,13 +151,13 @@ fn gcloud_available() -> bool {
 }
 
 fn local_gcloud_command(paths: &ProjectPaths) -> ProcessCommand {
-    let mut command = ProcessCommand::new("gcloud");
+    let mut command = ProcessCommand::new(crate::gcloud_exe());
     command.env("CLOUDSDK_CONFIG", paths.gcloud_dir());
     command
 }
 
 fn gcloud_command_for_credentials(paths: &ProjectPaths, credentials: &Path) -> ProcessCommand {
-    let mut command = ProcessCommand::new("gcloud");
+    let mut command = ProcessCommand::new(crate::gcloud_exe());
     if credentials.starts_with(paths.gcloud_dir()) {
         command.env("CLOUDSDK_CONFIG", paths.gcloud_dir());
     }
@@ -182,6 +183,14 @@ fn run_capture(command: &mut ProcessCommand, label: &str) -> Result<String> {
         anyhow::bail!("{label} failed: {}", command_error(&output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(crate) fn access_token(paths: &ProjectPaths) -> Result<String> {
+    let credentials = find_credentials(paths)
+        .ok_or_else(|| anyhow::anyhow!("no credentials found; run `cargo xtask gcloud auth`"))?;
+    let mut command = gcloud_command_for_credentials(paths, &credentials);
+    command.args(["auth", "application-default", "print-access-token"]);
+    run_capture(&mut command, "printing application-default access token")
 }
 
 fn copy_credentials(paths: &ProjectPaths) -> Result<PathBuf> {
@@ -292,7 +301,7 @@ fn active_account(paths: &ProjectPaths, local: bool) -> Result<Option<String>> {
     let mut command = if local {
         local_gcloud_command(paths)
     } else {
-        ProcessCommand::new("gcloud")
+        ProcessCommand::new(crate::gcloud_exe())
     };
     command.args([
         "auth",

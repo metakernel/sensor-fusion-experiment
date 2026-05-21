@@ -102,7 +102,7 @@ fn parse_listing_line(line: &str) -> Option<ListedObject> {
     let pre_uri = trimmed[..uri_start].trim();
     let uri = trimmed[uri_start..].split_whitespace().next()?;
 
-    if uri.ends_with('/') {
+    if uri.ends_with('/') || uri.ends_with(':') {
         return None;
     }
 
