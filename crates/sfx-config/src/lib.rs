@@ -71,6 +71,7 @@ pub enum ModelKind {
 pub struct TrainingConfig {
     pub run_name: String,
     pub batch_size: usize,
+    pub max_batches_per_epoch: Option<usize>,
     pub learning_rate: f32,
     pub epochs: usize,
     pub seed: u64,
@@ -138,6 +139,8 @@ struct TrainingFile {
 struct TrainingSection {
     run_name: String,
     batch_size: usize,
+    #[serde(default)]
+    max_batches_per_epoch: Option<usize>,
     learning_rate: f32,
     epochs: usize,
     seed: u64,
@@ -238,6 +241,7 @@ pub fn load_training_config(
     Ok(TrainingConfig {
         run_name: file.train.run_name,
         batch_size: file.train.batch_size,
+        max_batches_per_epoch: file.train.max_batches_per_epoch,
         learning_rate: file.train.learning_rate,
         epochs: file.train.epochs,
         seed: file.train.seed,
@@ -367,6 +371,13 @@ fn validate_training_section(path: &Path, config: &TrainingSection) -> Result<()
         config.batch_size > 0,
         "batch_size must be greater than zero",
     )?;
+    if let Some(max_batches_per_epoch) = config.max_batches_per_epoch {
+        ensure(
+            path,
+            max_batches_per_epoch > 0,
+            "max_batches_per_epoch must be greater than zero",
+        )?;
+    }
     ensure(
         path,
         config.learning_rate > 0.0,

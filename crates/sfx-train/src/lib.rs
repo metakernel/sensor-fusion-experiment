@@ -329,7 +329,11 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
     let metrics_path = run_dir.join("metrics.jsonl");
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
-    let batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
+    let total_batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
+    let batches_per_epoch = config
+        .max_batches_per_epoch
+        .unwrap_or(total_batches_per_epoch)
+        .min(total_batches_per_epoch);
     println!(
         "fusion training: samples={} batch_size={} batches/epoch={} epochs={}",
         train_dataset.len(),
@@ -367,6 +371,9 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
 
             total_loss += loss_value * current_batch_size as f64;
             total_samples += current_batch_size;
+            if batch_count >= batches_per_epoch {
+                break;
+            }
         }
 
         final_train_loss = total_loss / total_samples.max(1) as f64;

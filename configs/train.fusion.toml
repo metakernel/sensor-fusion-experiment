@@ -1,8 +1,9 @@
 [train]
 run_name = "fusion_run_001"
-batch_size = 8
+batch_size = 4
+max_batches_per_epoch = 4
 learning_rate = 0.001
-epochs = 3
+epochs = 2
 seed = 42
 
 [dataset]
