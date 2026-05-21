@@ -158,6 +158,123 @@ impl<B: Backend> RgbAutoencoder<B> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SharedLatentMultimodalAutoencoderConfig {
+    pub latent_dim: usize,
+    pub z_modality: usize,
+}
+
+impl SharedLatentMultimodalAutoencoderConfig {
+    pub fn new(latent_dim: usize, z_modality: usize) -> Self {
+        Self {
+            latent_dim,
+            z_modality,
+        }
+    }
+
+    pub fn init<B: Backend>(&self, device: &B::Device) -> SharedLatentMultimodalAutoencoder<B> {
+        SharedLatentMultimodalAutoencoder {
+            rgb_enc1: downsample_conv([RGB_CHANNELS, 16], device),
+            rgb_enc2: downsample_conv([16, 32], device),
+            rgb_enc3: downsample_conv([32, ENCODED_CHANNELS], device),
+            range_enc1: downsample_conv([RANGE_CHANNELS, 16], device),
+            range_enc2: downsample_conv([16, 32], device),
+            range_enc3: downsample_conv([32, ENCODED_CHANNELS], device),
+            rgb_to_z: LinearConfig::new(RGB_ENCODED_VALUES, self.z_modality).init(device),
+            range_to_z: LinearConfig::new(RANGE_ENCODED_VALUES, self.z_modality).init(device),
+            fusion_head: LinearConfig::new(self.z_modality * 2, self.latent_dim).init(device),
+            shared_to_rgb: LinearConfig::new(self.latent_dim, RGB_ENCODED_VALUES).init(device),
+            shared_to_range: LinearConfig::new(self.latent_dim, RANGE_ENCODED_VALUES).init(device),
+            rgb_dec1: upsample_conv([ENCODED_CHANNELS, 32], device),
+            rgb_dec2: upsample_conv([32, 16], device),
+            rgb_dec3: upsample_conv([16, RGB_CHANNELS], device),
+            range_dec1: upsample_conv([ENCODED_CHANNELS, 32], device),
+            range_dec2: upsample_conv([32, 16], device),
+            range_dec3: upsample_conv([16, RANGE_CHANNELS], device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct SharedLatentMultimodalAutoencoder<B: Backend> {
+    rgb_enc1: Conv2d<B>,
+    rgb_enc2: Conv2d<B>,
+    rgb_enc3: Conv2d<B>,
+    range_enc1: Conv2d<B>,
+    range_enc2: Conv2d<B>,
+    range_enc3: Conv2d<B>,
+    rgb_to_z: Linear<B>,
+    range_to_z: Linear<B>,
+    fusion_head: Linear<B>,
+    shared_to_rgb: Linear<B>,
+    shared_to_range: Linear<B>,
+    rgb_dec1: ConvTranspose2d<B>,
+    rgb_dec2: ConvTranspose2d<B>,
+    rgb_dec3: ConvTranspose2d<B>,
+    range_dec1: ConvTranspose2d<B>,
+    range_dec2: ConvTranspose2d<B>,
+    range_dec3: ConvTranspose2d<B>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FusionOutput<B: Backend> {
+    pub rgb_hat: Tensor<B, 4>,
+    pub range_hat: Tensor<B, 4>,
+    pub z_rgb: Tensor<B, 2>,
+    pub z_range: Tensor<B, 2>,
+    pub z_shared: Tensor<B, 2>,
+}
+
+impl<B: Backend> SharedLatentMultimodalAutoencoder<B> {
+    pub fn forward(&self, rgb: Tensor<B, 4>, range: Tensor<B, 4>) -> FusionOutput<B> {
+        let rgb_features = relu(self.rgb_enc1.forward(rgb));
+        let rgb_features = relu(self.rgb_enc2.forward(rgb_features));
+        let rgb_features = relu(self.rgb_enc3.forward(rgb_features));
+        let [batch_size, _, _, _] = rgb_features.dims();
+        let rgb_features = rgb_features.reshape([batch_size, RGB_ENCODED_VALUES]);
+        let z_rgb = self.rgb_to_z.forward(rgb_features);
+
+        let range_features = relu(self.range_enc1.forward(range));
+        let range_features = relu(self.range_enc2.forward(range_features));
+        let range_features = relu(self.range_enc3.forward(range_features));
+        let range_features = range_features.reshape([batch_size, RANGE_ENCODED_VALUES]);
+        let z_range = self.range_to_z.forward(range_features);
+
+        let fused = Tensor::cat(vec![z_rgb.clone(), z_range.clone()], 1);
+        let z_shared = self.fusion_head.forward(fused);
+
+        let rgb_decoded = relu(self.shared_to_rgb.forward(z_shared.clone()));
+        let rgb_decoded = rgb_decoded.reshape([
+            batch_size,
+            ENCODED_CHANNELS,
+            RGB_ENCODED_HEIGHT,
+            RGB_ENCODED_WIDTH,
+        ]);
+        let rgb_decoded = relu(self.rgb_dec1.forward(rgb_decoded));
+        let rgb_decoded = relu(self.rgb_dec2.forward(rgb_decoded));
+        let rgb_hat = sigmoid(self.rgb_dec3.forward(rgb_decoded));
+
+        let range_decoded = relu(self.shared_to_range.forward(z_shared.clone()));
+        let range_decoded = range_decoded.reshape([
+            batch_size,
+            ENCODED_CHANNELS,
+            RANGE_ENCODED_HEIGHT,
+            RANGE_ENCODED_WIDTH,
+        ]);
+        let range_decoded = relu(self.range_dec1.forward(range_decoded));
+        let range_decoded = relu(self.range_dec2.forward(range_decoded));
+        let range_hat = sigmoid(self.range_dec3.forward(range_decoded));
+
+        FusionOutput {
+            rgb_hat,
+            range_hat,
+            z_rgb,
+            z_range,
+            z_shared,
+        }
+    }
+}
+
 fn downsample_conv<B: Backend>(channels: [usize; 2], device: &B::Device) -> Conv2d<B> {
     Conv2dConfig::new(channels, [4, 4])
         .with_stride([2, 2])
@@ -206,5 +323,28 @@ mod tests {
             [2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH]
         );
         assert_eq!(output.z.dims(), [2, 16]);
+    }
+
+    #[test]
+    fn shared_latent_autoencoder_preserves_rgb_and_range_shapes() {
+        let device = Default::default();
+        let model = SharedLatentMultimodalAutoencoderConfig::new(16, 32).init::<Flex>(&device);
+        let rgb = Tensor::<Flex, 4>::zeros([2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH], &device);
+        let range =
+            Tensor::<Flex, 4>::zeros([2, RANGE_CHANNELS, RANGE_HEIGHT, RANGE_WIDTH], &device);
+
+        let output = model.forward(rgb, range);
+
+        assert_eq!(
+            output.rgb_hat.dims(),
+            [2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH]
+        );
+        assert_eq!(
+            output.range_hat.dims(),
+            [2, RANGE_CHANNELS, RANGE_HEIGHT, RANGE_WIDTH]
+        );
+        assert_eq!(output.z_rgb.dims(), [2, 32]);
+        assert_eq!(output.z_range.dims(), [2, 32]);
+        assert_eq!(output.z_shared.dims(), [2, 16]);
     }
 }

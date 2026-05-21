@@ -9,7 +9,10 @@ use serde::Serialize;
 use sfx_config::ModelKind;
 use sfx_core::manifest::Split;
 use sfx_data::{BatchOptions, FusionDataset};
-use sfx_models::{RangeAutoencoder, RangeAutoencoderConfig, RgbAutoencoder, RgbAutoencoderConfig};
+use sfx_models::{
+    RangeAutoencoder, RangeAutoencoderConfig, RgbAutoencoder, RgbAutoencoderConfig,
+    SharedLatentMultimodalAutoencoder, SharedLatentMultimodalAutoencoderConfig,
+};
 use std::path::{Path, PathBuf};
 
 pub const CRATE_NAME: &str = "sfx-train";
@@ -283,6 +286,146 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
     Ok(summary)
 }
 
+pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<TrainingSummary> {
+    let config = sfx_config::load_training_config(root, config_path)
+        .with_context(|| format!("loading training config {}", config_path.display()))?;
+    if config.model.kind != ModelKind::Fusion {
+        bail!(
+            "Phase 12 only supports fusion training; config uses {:?}",
+            config.model.kind
+        );
+    }
+
+    let manifest_path = root.join(".xtask/manifests/processed_samples.json");
+    let train_dataset = FusionDataset::open_split(
+        &config.dataset.processed_dir,
+        &manifest_path,
+        Some(Split::Train),
+    )
+    .with_context(|| format!("opening training dataset from {}", manifest_path.display()))?;
+    if train_dataset.is_empty() {
+        bail!("training split is empty; run `cargo xtask dataset prepare --splits train` first");
+    }
+    train_dataset.validate_tensor_files()?;
+
+    let run_dir = root
+        .join("artifacts/checkpoints/fusion")
+        .join(&config.run_name);
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    copy_if_exists(config_path, &run_dir.join("config.toml"))?;
+    copy_if_exists(&config.dataset_config_path, &run_dir.join("dataset.toml"))?;
+    copy_if_exists(&config.model_config_path, &run_dir.join("model.toml"))?;
+
+    let device = Device::<TrainBackend>::default();
+    TrainBackend::seed(&device, config.seed);
+    let mut model = SharedLatentMultimodalAutoencoderConfig::new(
+        config.model.latent_dim,
+        config.model.effective_z_modality(),
+    )
+    .init::<TrainBackend>(&device);
+    let mut optimizer =
+        AdamConfig::new().init::<TrainBackend, SharedLatentMultimodalAutoencoder<TrainBackend>>();
+
+    let metrics_path = run_dir.join("metrics.jsonl");
+    let mut metric_lines = String::new();
+    let mut final_train_loss = f64::INFINITY;
+    let batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
+    println!(
+        "fusion training: samples={} batch_size={} batches/epoch={} epochs={}",
+        train_dataset.len(),
+        config.batch_size,
+        batches_per_epoch,
+        config.epochs
+    );
+
+    for epoch in 1..=config.epochs {
+        let options = BatchOptions::new(config.batch_size).shuffled(config.seed + epoch as u64);
+        let mut total_loss = 0.0f64;
+        let mut total_samples = 0usize;
+        let mut batch_count = 0usize;
+
+        for batch in train_dataset.batches(options)? {
+            let batch = batch?.into_burn::<TrainBackend>(&device);
+            let current_batch_size = batch.batch_size();
+            batch_count += 1;
+            if batch_count == 1 || batch_count % 5 == 0 || batch_count == batches_per_epoch {
+                println!(
+                    "epoch {epoch:03}/{:03} batch {batch_count}/{batches_per_epoch}",
+                    config.epochs
+                );
+            }
+            let rgb_target = batch.rgb.clone();
+            let range_target = batch.range.clone();
+            let output = model.forward(batch.rgb, batch.range);
+            let rgb_loss = mse_loss(output.rgb_hat, rgb_target);
+            let range_loss = mse_loss(output.range_hat, range_target);
+            let loss = rgb_loss + range_loss;
+            let loss_value = loss.clone().into_scalar().to_f64();
+
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            model = optimizer.step(config.learning_rate as f64, model, grads);
+
+            total_loss += loss_value * current_batch_size as f64;
+            total_samples += current_batch_size;
+        }
+
+        final_train_loss = total_loss / total_samples.max(1) as f64;
+        let metric = EpochMetric {
+            epoch,
+            train_loss: final_train_loss,
+            val_loss: None,
+            sample_count: total_samples,
+            batch_count,
+        };
+        metric_lines.push_str(&serde_json::to_string(&metric)?);
+        metric_lines.push('\n');
+        println!(
+            "epoch {epoch:03}/{:03} train_loss={:.6} batches={batch_count}",
+            config.epochs, final_train_loss
+        );
+    }
+
+    std::fs::write(&metrics_path, metric_lines)
+        .with_context(|| format!("writing {}", metrics_path.display()))?;
+
+    let valid_model = model.valid();
+    let checkpoint_stem = run_dir.join("model");
+    valid_model
+        .clone()
+        .save_file(
+            &checkpoint_stem,
+            &BinFileRecorder::<FullPrecisionSettings>::default(),
+        )
+        .with_context(|| {
+            format!(
+                "saving model checkpoint to {}.bin",
+                checkpoint_stem.display()
+            )
+        })?;
+    write_fusion_previews(&valid_model, &train_dataset, &run_dir.join("previews"))?;
+
+    let summary = TrainingSummary {
+        run_name: config.run_name,
+        run_dir: run_dir.clone(),
+        metrics_path: metrics_path.clone(),
+        summary_path: run_dir.join("summary.json"),
+        checkpoint_path: run_dir.join("model.bin"),
+        epochs: config.epochs,
+        train_samples: train_dataset.len(),
+        batch_size: config.batch_size,
+        latent_dim: config.model.latent_dim,
+        final_train_loss,
+        backend: "burn-flex-autodiff".to_string(),
+    };
+    std::fs::write(
+        &summary.summary_path,
+        format!("{}\n", serde_json::to_string_pretty(&summary)?),
+    )
+    .with_context(|| format!("writing {}", summary.summary_path.display()))?;
+
+    Ok(summary)
+}
+
 fn mse_loss<B: Backend>(pred: Tensor<B, 4>, target: Tensor<B, 4>) -> Tensor<B, 1> {
     (pred - target).square().mean()
 }
@@ -363,6 +506,59 @@ fn write_rgb_previews(
             h,
             w,
             &path,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_fusion_previews(
+    model: &SharedLatentMultimodalAutoencoder<InnerBackend>,
+    dataset: &FusionDataset,
+    out_dir: &Path,
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let device = Device::<InnerBackend>::default();
+    let Some(batch) = dataset.batches(BatchOptions::new(4))?.next() else {
+        return Ok(());
+    };
+    let raw_batch = batch?;
+    let batch_size = raw_batch.batch_size();
+    let batch = raw_batch.into_burn::<InnerBackend>(&device);
+    let rgb_target = batch.rgb.clone();
+    let range_target = batch.range.clone();
+    let output = model.forward(batch.rgb, batch.range);
+    let rgb_target_values = tensor_values(rgb_target)?;
+    let rgb_recon_values = tensor_values(output.rgb_hat)?;
+    let range_target_values = tensor_values(range_target)?;
+    let range_recon_values = tensor_values(output.range_hat)?;
+
+    let rgb_h = dataset.rgb_shape().height;
+    let rgb_w = dataset.rgb_shape().width;
+    let rgb_c = dataset.rgb_shape().channels;
+    let rgb_sample_values = rgb_c * rgb_h * rgb_w;
+    let range_h = dataset.range_shape().height;
+    let range_w = dataset.range_shape().width;
+    let range_c = dataset.range_shape().channels;
+    let range_sample_values = range_c * range_h * range_w;
+
+    for sample_idx in 0..batch_size {
+        let rgb_offset = sample_idx * rgb_sample_values;
+        save_side_by_side_rgb(
+            &rgb_target_values[rgb_offset..rgb_offset + rgb_sample_values],
+            &rgb_recon_values[rgb_offset..rgb_offset + rgb_sample_values],
+            rgb_h,
+            rgb_w,
+            &out_dir.join(format!("rgb_recon_{sample_idx:03}.png")),
+        )?;
+
+        let range_offset = sample_idx * range_sample_values;
+        save_side_by_side_range(
+            &range_target_values[range_offset..range_offset + range_h * range_w],
+            &range_recon_values[range_offset..range_offset + range_h * range_w],
+            range_h,
+            range_w,
+            &out_dir.join(format!("range_recon_{sample_idx:03}.png")),
         )?;
     }
 

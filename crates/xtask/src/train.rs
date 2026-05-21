@@ -1,5 +1,5 @@
 use crate::{ProjectPaths, TrainArgs, display_from_root};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use sfx_config::ModelKind;
 
 pub(crate) fn run(args: TrainArgs, paths: &ProjectPaths) -> Result<()> {
@@ -7,9 +7,7 @@ pub(crate) fn run(args: TrainArgs, paths: &ProjectPaths) -> Result<()> {
     let summary = match config.model.kind {
         ModelKind::RangeOnly => sfx_train::train_range_autoencoder(&paths.root, &args.config)?,
         ModelKind::RgbOnly => sfx_train::train_rgb_autoencoder(&paths.root, &args.config)?,
-        ModelKind::Fusion => {
-            bail!("fusion training starts in Phase 12; use a range-only or RGB-only config for now")
-        }
+        ModelKind::Fusion => sfx_train::train_fusion_autoencoder(&paths.root, &args.config)?,
     };
 
     println!("ok   run {}", summary.run_name);

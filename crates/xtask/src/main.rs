@@ -405,6 +405,9 @@ fn validate_configs(paths: &ProjectPaths) -> usize {
     errors += check_config("configs/train.rgb-only.toml", || {
         sfx_config::load_training_config(root, "configs/train.rgb-only.toml").map(|_| ())
     });
+    errors += check_config("configs/train.fusion.toml", || {
+        sfx_config::load_training_config(root, "configs/train.fusion.toml").map(|_| ())
+    });
     errors += check_config("configs/train.debug.toml", || {
         sfx_config::load_training_config(root, "configs/train.debug.toml").map(|_| ())
     });
