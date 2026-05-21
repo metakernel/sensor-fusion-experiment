@@ -42,6 +42,7 @@ pub(crate) enum GcloudCommand {
 pub(crate) enum DatasetCommand {
     List(DatasetListArgs),
     Fetch(DatasetFetchArgs),
+    Prepare(DatasetPrepareArgs),
 }
 
 #[derive(Args, Debug)]
@@ -60,6 +61,8 @@ pub(crate) struct DatasetListArgs {
     pub(crate) prefix: Option<String>,
     #[arg(long)]
     pub(crate) split_prefix: Option<String>,
+    #[arg(long)]
+    pub(crate) component: Option<String>,
     #[arg(long)]
     pub(crate) dry_run: bool,
 }
@@ -82,8 +85,28 @@ pub(crate) struct DatasetFetchArgs {
     pub(crate) manifest: Option<PathBuf>,
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) extra_components: Vec<String>,
     #[arg(long)]
     pub(crate) dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DatasetPrepareArgs {
+    #[arg(long, default_value = "waymo")]
+    pub(crate) dataset: String,
+    #[arg(long, value_delimiter = ',', value_parser = parse_dataset_source_split, default_value = "train")]
+    pub(crate) splits: Vec<DatasetSourceSplit>,
+    #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
+    pub(crate) config: PathBuf,
+    #[arg(long)]
+    pub(crate) input: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) max_frames: Option<usize>,
+    #[arg(long)]
+    pub(crate) inspect: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -222,6 +245,14 @@ impl ProjectPaths {
 
     fn downloaded_file_manifest_path(&self) -> PathBuf {
         self.root.join(".xtask/manifests/downloaded_files.json")
+    }
+
+    pub(crate) fn processed_sample_manifest_path(&self) -> PathBuf {
+        self.root.join(".xtask/manifests/processed_samples.json")
+    }
+
+    pub(crate) fn splits_manifest_path(&self) -> PathBuf {
+        self.root.join(".xtask/manifests/splits.json")
     }
 }
 

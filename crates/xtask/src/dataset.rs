@@ -1,11 +1,12 @@
 use crate::{
-    DatasetCommand, DatasetFetchArgs, DatasetListArgs, DatasetSourceSplit, ProjectPaths,
-    display_from_root,
+    DatasetCommand, DatasetFetchArgs, DatasetListArgs, DatasetPrepareArgs, DatasetSourceSplit,
+    ProjectPaths, display_from_root,
 };
 use anyhow::{Context, Result};
 use sfx_core::manifest::{
     DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, MANIFEST_SCHEMA_VERSION,
-    RawFileEntry, RawFileManifest, SourceSplit, read_manifest, write_manifest,
+    ProcessedSampleManifest, RawFileEntry, RawFileManifest, SplitsManifest, SourceSplit, Split,
+    read_manifest, write_manifest,
 };
 use sfx_waymo::{DiscoveryConfig, parse_gcloud_storage_listing, split_label};
 use std::collections::BTreeSet;
@@ -16,6 +17,7 @@ pub(crate) fn run(command: DatasetCommand, paths: &ProjectPaths) -> Result<()> {
     match command {
         DatasetCommand::List(args) => list(args, paths),
         DatasetCommand::Fetch(args) => fetch(args, paths),
+        DatasetCommand::Prepare(args) => prepare(args, paths),
     }
 }
 
@@ -30,13 +32,20 @@ fn list(args: DatasetListArgs, paths: &ProjectPaths) -> Result<()> {
         .with_context(|| format!("loading Waymo config {}", args.config.display()))?;
     let split = SourceSplit::from(args.split);
     let discovery = discovery_config(&args, waymo_config);
-    let uri = discovery.split_uri(&split);
+    let base_uri = discovery.split_uri(&split);
+    let uri = match &args.component {
+        Some(comp) => format!("{base_uri}/{comp}"),
+        None => base_uri,
+    };
     let limit = (args.limit > 0).then_some(args.limit);
 
     if args.dry_run {
         println!("dataset: {}", dataset_config.name);
         println!("split: {}", split_label(&split));
         println!("url: {uri}");
+        if let Some(c) = &args.component {
+            println!("component: {c}");
+        }
         println!("limit: {}", limit_label(limit));
         println!("dry-run: gcloud storage ls --recursive --long {uri}");
         return Ok(());
@@ -110,8 +119,20 @@ fn fetch(args: DatasetFetchArgs, paths: &ProjectPaths) -> Result<()> {
         );
     }
 
+    // Build the full list: primary files + companion component files
+    let mut all_files: Vec<RawFileEntry> = selected.clone();
+    for comp in &args.extra_components {
+        for file in &selected {
+            if let Some(companion) = companion_component_entry(file, comp) {
+                if !all_files.iter().any(|f| f.uri == companion.uri) {
+                    all_files.push(companion);
+                }
+            }
+        }
+    }
+
     println!("Waymo files selected for download:");
-    for file in &selected {
+    for file in &all_files {
         let target = target_path_for_raw(&out_dir, file);
         println!(
             "  [{}] {} -> {}",
@@ -128,9 +149,9 @@ fn fetch(args: DatasetFetchArgs, paths: &ProjectPaths) -> Result<()> {
 
     let mut entries = Vec::new();
     let mut failed = 0usize;
-    let total = selected.len();
+    let total = all_files.len();
 
-    for (index, file) in selected.iter().enumerate() {
+    for (index, file) in all_files.iter().enumerate() {
         let target = target_path_for_raw(&out_dir, file);
         println!(
             "[{}/{}] {}",
@@ -174,6 +195,172 @@ fn fetch(args: DatasetFetchArgs, paths: &ProjectPaths) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn companion_component_entry(file: &RawFileEntry, component: &str) -> Option<RawFileEntry> {
+    // URI: gs://bucket/split/current_component/file.parquet
+    // Replace current_component with the given component.
+    let parts: Vec<&str> = file.uri.splitn(6, '/').collect();
+    if parts.len() == 6 {
+        let companion_uri = format!(
+            "gs://{}/{}/{}/{}",
+            parts[2], parts[3], component, parts[5]
+        );
+        Some(RawFileEntry {
+            uri: companion_uri,
+            split: file.split.clone(),
+            file_name: file.file_name.clone(),
+            size_bytes: None,
+            checksum: None,
+        })
+    } else {
+        None
+    }
+}
+
+fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
+    if args.dataset != "waymo" {
+        anyhow::bail!("unsupported dataset {}; expected waymo", args.dataset);
+    }
+
+    let dataset_config = sfx_config::load_dataset_config(&paths.root, &args.config)
+        .with_context(|| format!("loading dataset config {}", args.config.display()))?;
+    let out_dir = args
+        .output
+        .as_ref()
+        .map(|p| sfx_config::resolve_from_root(&paths.root, p))
+        .unwrap_or(dataset_config.processed_dir.clone());
+    let in_dir = args
+        .input
+        .as_ref()
+        .map(|p| sfx_config::resolve_from_root(&paths.root, p))
+        .unwrap_or(dataset_config.raw_dir.clone());
+
+    let mut all_entries: Vec<sfx_core::manifest::ProcessedSampleEntry> = Vec::new();
+    let mut train_ids = Vec::new();
+    let mut val_ids = Vec::new();
+    let mut test_ids = Vec::new();
+    let mut sample_counter = 0usize;
+
+    for split_arg in &args.splits {
+        let (split_dir_name, split) = match split_arg {
+            DatasetSourceSplit::Training => ("training", Split::Train),
+            DatasetSourceSplit::Validation => ("validation", Split::Val),
+            DatasetSourceSplit::Testing => ("testing", Split::Test),
+        };
+
+        let camera_dir = in_dir.join(split_dir_name).join("camera_image");
+        let lidar_dir = in_dir.join(split_dir_name).join("lidar");
+
+        if !camera_dir.exists() {
+            println!("warn no camera_image dir for {split_dir_name}; skipping");
+            continue;
+        }
+        if !lidar_dir.exists() {
+            println!("warn no lidar dir for {split_dir_name}; skipping");
+            continue;
+        }
+
+        let camera_files = parquet_files_in(&camera_dir)?;
+        let lidar_files = parquet_files_in(&lidar_dir)?;
+
+        if args.inspect {
+            println!("\n--- camera_image schema ({split_dir_name}) ---");
+            if let Some(cam_path) = camera_files.first() {
+                for f in sfx_waymo::extract::read_schema(cam_path)? {
+                    println!("  {}: {}", f.name, f.data_type);
+                }
+            }
+            println!("\n--- lidar schema ({split_dir_name}) ---");
+            if let Some(lid_path) = lidar_files.first() {
+                for f in sfx_waymo::extract::read_schema(lid_path)? {
+                    println!("  {}: {}", f.name, f.data_type);
+                }
+            }
+            continue;
+        }
+
+        for (cam_path, lid_path) in camera_files.iter().zip(lidar_files.iter()) {
+            println!(
+                "extracting {} + {}",
+                cam_path.file_name().unwrap_or_default().to_string_lossy(),
+                lid_path.file_name().unwrap_or_default().to_string_lossy()
+            );
+
+            let camera_frames =
+                sfx_waymo::extract::read_camera_frames(cam_path, args.max_frames)?;
+            let lidar_frames = sfx_waymo::extract::read_lidar_frames(lid_path, args.max_frames)?;
+
+            println!(
+                "  camera frames: {}, lidar frames: {}",
+                camera_frames.len(),
+                lidar_frames.len()
+            );
+
+            let pairs = sfx_preprocess::align_frames(camera_frames, lidar_frames);
+            println!("  aligned pairs: {}", pairs.len());
+
+            for pair in &pairs {
+                let entry =
+                    sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
+                let id = entry.meta.id.clone();
+                all_entries.push(entry);
+                match &split {
+                    Split::Train => train_ids.push(id),
+                    Split::Val => val_ids.push(id),
+                    Split::Test => test_ids.push(id),
+                }
+                sample_counter += 1;
+            }
+
+            println!("  ok   wrote {} samples", pairs.len());
+        }
+    }
+
+    if args.inspect {
+        return Ok(());
+    }
+
+    let sample_manifest = ProcessedSampleManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        dataset: Some(dataset_config.name.clone()),
+        rgb_shape: None,
+        range_shape: None,
+        samples: all_entries,
+    };
+    sample_manifest.validate()?;
+    let sample_manifest_path = paths.processed_sample_manifest_path();
+    write_manifest(&sample_manifest_path, &sample_manifest)?;
+    println!("ok   {}", display_from_root(&paths.root, &sample_manifest_path));
+
+    let splits_manifest = SplitsManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        dataset: Some(dataset_config.name),
+        train: train_ids,
+        val: val_ids,
+        test: test_ids,
+    };
+    splits_manifest.validate()?;
+    let splits_path = paths.splits_manifest_path();
+    write_manifest(&splits_path, &splits_manifest)?;
+    println!("ok   {}", display_from_root(&paths.root, &splits_path));
+
+    println!("total samples extracted: {sample_counter}");
+    Ok(())
+}
+
+fn parquet_files_in(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    files.sort();
+    Ok(files)
 }
 
 fn discovery_config(args: &DatasetListArgs, waymo: sfx_config::WaymoConfig) -> DiscoveryConfig {
@@ -627,6 +814,7 @@ mod tests {
             config: PathBuf::from("configs/dataset.waymo.small.toml"),
             manifest: None,
             out: None,
+            extra_components: Vec::new(),
             dry_run: false,
         }
     }

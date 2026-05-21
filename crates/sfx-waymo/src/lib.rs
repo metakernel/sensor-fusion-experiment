@@ -1,3 +1,5 @@
+pub mod extract;
+
 use sfx_core::manifest::{RawFileEntry, SourceSplit};
 
 pub const CRATE_NAME: &str = "sfx-waymo";
