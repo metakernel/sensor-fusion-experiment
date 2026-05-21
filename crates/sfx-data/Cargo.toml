@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+burn = ["dep:burn"]
+
 [dependencies]
 anyhow = { workspace = true }
+burn = { version = "0.21.0", default-features = false, features = ["std"], optional = true }
 sfx-core = { workspace = true }

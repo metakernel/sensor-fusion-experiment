@@ -214,6 +214,28 @@ impl FusionBatch {
         self.sample_ids.len()
     }
 
+    #[cfg(feature = "burn")]
+    pub fn into_burn<B>(self, device: &B::Device) -> BurnFusionBatch<B>
+    where
+        B: burn::prelude::Backend,
+    {
+        use burn::prelude::{Tensor, TensorData};
+
+        let rgb_shape = self.rgb_nchw_shape();
+        let range_shape = self.range_nchw_shape();
+        let rgb = Tensor::<B, 4>::from_data(TensorData::new(self.rgb, rgb_shape), device);
+        let range = Tensor::<B, 4>::from_data(TensorData::new(self.range, range_shape), device);
+
+        BurnFusionBatch {
+            rgb,
+            range,
+            entries: self.entries,
+            sample_ids: self.sample_ids,
+            rgb_shape: self.rgb_shape,
+            range_shape: self.range_shape,
+        }
+    }
+
     pub fn rgb_nchw_shape(&self) -> [usize; 4] {
         [
             self.batch_size(),
@@ -274,6 +296,30 @@ impl FusionBatch {
             rgb_shape,
             range_shape,
         })
+    }
+}
+
+#[cfg(feature = "burn")]
+#[derive(Debug, Clone)]
+pub struct BurnFusionBatch<B>
+where
+    B: burn::prelude::Backend,
+{
+    pub rgb: burn::prelude::Tensor<B, 4>,
+    pub range: burn::prelude::Tensor<B, 4>,
+    pub entries: Vec<ProcessedSampleEntry>,
+    pub sample_ids: Vec<SampleId>,
+    pub rgb_shape: TensorShape,
+    pub range_shape: TensorShape,
+}
+
+#[cfg(feature = "burn")]
+impl<B> BurnFusionBatch<B>
+where
+    B: burn::prelude::Backend,
+{
+    pub fn batch_size(&self) -> usize {
+        self.sample_ids.len()
     }
 }
 
