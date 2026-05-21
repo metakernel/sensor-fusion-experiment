@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
-use sfx_core::manifest::{
-    MultimodalSampleMeta, ProcessedSampleEntry, SampleId, Split,
-};
+use sfx_core::manifest::{MultimodalSampleMeta, ProcessedSampleEntry, SampleId, Split};
 use sfx_waymo::extract::{CameraFrame, LidarFrame};
 use std::path::{Path, PathBuf};
 
@@ -22,10 +20,7 @@ pub struct ExtractedPair {
     pub range_shape: [usize; 3],
 }
 
-pub fn align_frames(
-    camera: Vec<CameraFrame>,
-    lidar: Vec<LidarFrame>,
-) -> Vec<ExtractedPair> {
+pub fn align_frames(camera: Vec<CameraFrame>, lidar: Vec<LidarFrame>) -> Vec<ExtractedPair> {
     let mut pairs = Vec::new();
 
     for cam in &camera {
@@ -53,9 +48,7 @@ pub fn write_sample(
     sample_idx: usize,
 ) -> Result<ProcessedSampleEntry> {
     let sample_id = format!("sample_{sample_idx:06}");
-    let sample_dir = output_dir
-        .join(split_dir(split))
-        .join(&sample_id);
+    let sample_dir = output_dir.join(split_dir(split)).join(&sample_id);
     std::fs::create_dir_all(&sample_dir)
         .with_context(|| format!("creating {}", sample_dir.display()))?;
 
@@ -66,8 +59,7 @@ pub fn write_sample(
     let preview_range_path = sample_dir.join("preview_range.png");
 
     // --- RGB: decode JPEG → resize [H, W] → normalise → CHW f32 binary ---
-    let rgb_chw = process_rgb(&pair.jpeg_bytes, RGB_H, RGB_W)
-        .context("processing RGB frame")?;
+    let rgb_chw = process_rgb(&pair.jpeg_bytes, RGB_H, RGB_W).context("processing RGB frame")?;
     let rgb_bytes: Vec<u8> = rgb_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&rgb_path, &rgb_bytes)
         .with_context(|| format!("writing {}", rgb_path.display()))?;
@@ -223,4 +215,3 @@ fn split_dir(split: &Split) -> &'static str {
 fn relative_path(base: &Path, full: &Path) -> PathBuf {
     full.strip_prefix(base).unwrap_or(full).to_path_buf()
 }
-

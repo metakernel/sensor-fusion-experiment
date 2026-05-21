@@ -1,11 +1,11 @@
 use crate::{
-    DatasetCommand, DatasetFetchArgs, DatasetInspectArgs, DatasetListArgs, DatasetPreviewArgs,
-    DatasetPrepareArgs, DatasetSourceSplit, ProjectPaths, display_from_root,
+    DatasetCommand, DatasetFetchArgs, DatasetInspectArgs, DatasetListArgs, DatasetPrepareArgs,
+    DatasetPreviewArgs, DatasetSourceSplit, ProjectPaths, display_from_root,
 };
 use anyhow::{Context, Result};
 use sfx_core::manifest::{
     DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, MANIFEST_SCHEMA_VERSION,
-    ProcessedSampleManifest, RawFileEntry, RawFileManifest, SplitsManifest, SourceSplit, Split,
+    ProcessedSampleManifest, RawFileEntry, RawFileManifest, SourceSplit, Split, SplitsManifest,
     read_manifest, write_manifest,
 };
 use sfx_waymo::{DiscoveryConfig, parse_gcloud_storage_listing, split_label};
@@ -204,10 +204,7 @@ fn companion_component_entry(file: &RawFileEntry, component: &str) -> Option<Raw
     // Replace current_component with the given component.
     let parts: Vec<&str> = file.uri.splitn(6, '/').collect();
     if parts.len() == 6 {
-        let companion_uri = format!(
-            "gs://{}/{}/{}/{}",
-            parts[2], parts[3], component, parts[5]
-        );
+        let companion_uri = format!("gs://{}/{}/{}/{}", parts[2], parts[3], component, parts[5]);
         Some(RawFileEntry {
             uri: companion_uri,
             split: file.split.clone(),
@@ -289,8 +286,7 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 lid_path.file_name().unwrap_or_default().to_string_lossy()
             );
 
-            let camera_frames =
-                sfx_waymo::extract::read_camera_frames(cam_path, args.max_frames)?;
+            let camera_frames = sfx_waymo::extract::read_camera_frames(cam_path, args.max_frames)?;
             let lidar_frames = sfx_waymo::extract::read_lidar_frames(lid_path, args.max_frames)?;
 
             println!(
@@ -303,8 +299,7 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
             println!("  aligned pairs: {}", pairs.len());
 
             for pair in &pairs {
-                let entry =
-                    sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
+                let entry = sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
                 let id = entry.meta.id.clone();
                 all_entries.push(entry);
                 match &split {
@@ -341,7 +336,10 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
     sample_manifest.validate()?;
     let sample_manifest_path = paths.processed_sample_manifest_path();
     write_manifest(&sample_manifest_path, &sample_manifest)?;
-    println!("ok   {}", display_from_root(&paths.root, &sample_manifest_path));
+    println!(
+        "ok   {}",
+        display_from_root(&paths.root, &sample_manifest_path)
+    );
 
     let splits_manifest = SplitsManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -761,14 +759,21 @@ fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
     let processed_dir = paths.root.join(&dataset_config.processed_dir);
 
     println!("dataset:       {}", dataset_config.name);
-    println!("processed dir: {}", display_from_root(&paths.root, &processed_dir));
+    println!(
+        "processed dir: {}",
+        display_from_root(&paths.root, &processed_dir)
+    );
     println!("schema:        v{}", manifest.schema_version);
 
     if let Some(shape) = &manifest.rgb_shape {
         let values = shape.value_count();
         println!(
             "rgb shape:     [{}, {}, {}]  ({} values, {} bytes/sample)",
-            shape.channels, shape.height, shape.width, values, values * 4
+            shape.channels,
+            shape.height,
+            shape.width,
+            values,
+            values * 4
         );
     } else {
         println!("rgb shape:     (not recorded)");
@@ -777,21 +782,28 @@ fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
         let values = shape.value_count();
         println!(
             "range shape:   [{}, {}, {}]  ({} values, {} bytes/sample)",
-            shape.channels, shape.height, shape.width, values, values * 4
+            shape.channels,
+            shape.height,
+            shape.width,
+            values,
+            values * 4
         );
     } else {
         println!("range shape:   (not recorded)");
     }
 
     // --- split counts ---
-    let (train_n, val_n, test_n) = manifest.samples.iter().fold(
-        (0usize, 0usize, 0usize),
-        |(tr, v, te), s| match s.meta.split {
-            sfx_core::manifest::Split::Train => (tr + 1, v, te),
-            sfx_core::manifest::Split::Val => (tr, v + 1, te),
-            sfx_core::manifest::Split::Test => (tr, v, te + 1),
-        },
-    );
+    let (train_n, val_n, test_n) =
+        manifest
+            .samples
+            .iter()
+            .fold((0usize, 0usize, 0usize), |(tr, v, te), s| {
+                match s.meta.split {
+                    sfx_core::manifest::Split::Train => (tr + 1, v, te),
+                    sfx_core::manifest::Split::Val => (tr, v + 1, te),
+                    sfx_core::manifest::Split::Test => (tr, v, te + 1),
+                }
+            });
     println!();
     println!("split counts:");
     println!("  train: {train_n}");
@@ -855,8 +867,8 @@ fn compute_tensor_stats(
 
     for entry in entries {
         let rgb_path = processed_dir.join(&entry.meta.rgb_path);
-        let bytes = std::fs::read(&rgb_path)
-            .with_context(|| format!("reading {}", rgb_path.display()))?;
+        let bytes =
+            std::fs::read(&rgb_path).with_context(|| format!("reading {}", rgb_path.display()))?;
         let values = bytes_to_f32_le(&bytes);
         for &v in &values {
             rgb_acc.push(v);
@@ -931,7 +943,12 @@ impl StatsAccum {
 
     fn finish(self) -> TensorStats {
         if self.count == 0 {
-            return TensorStats { min: 0.0, max: 0.0, mean: 0.0, std: 0.0 };
+            return TensorStats {
+                min: 0.0,
+                max: 0.0,
+                mean: 0.0,
+                std: 0.0,
+            };
         }
         let mean = self.sum / self.count as f64;
         let variance = (self.sum_sq / self.count as f64) - mean * mean;
@@ -992,8 +1009,7 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
     }
 
     let out_dir = paths.root.join(&args.out);
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
     let cols = 4usize;
     let rows = selected.len().div_ceil(cols);
@@ -1006,14 +1022,9 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
     let range_tile_w = sfx_preprocess::RANGE_W as u32;
     let range_tile_h = sfx_preprocess::RANGE_H as u32;
 
-    let mut rgb_canvas = image::RgbImage::new(
-        cols as u32 * rgb_tile_w,
-        rows as u32 * rgb_tile_h,
-    );
-    let mut range_canvas = image::GrayImage::new(
-        cols as u32 * range_tile_w,
-        rows as u32 * range_tile_h,
-    );
+    let mut rgb_canvas = image::RgbImage::new(cols as u32 * rgb_tile_w, rows as u32 * rgb_tile_h);
+    let mut range_canvas =
+        image::GrayImage::new(cols as u32 * range_tile_w, rows as u32 * range_tile_h);
 
     let mut loaded = 0usize;
     for (idx, entry) in selected.iter().enumerate() {

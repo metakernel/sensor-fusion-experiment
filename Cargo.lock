@@ -1046,6 +1046,10 @@ dependencies = [
 [[package]]
 name = "sfx-data"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sfx-core",
+]
 
 [[package]]
 name = "sfx-eval"

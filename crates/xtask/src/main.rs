@@ -157,7 +157,11 @@ impl From<DatasetSourceSplit> for SourceSplit {
 }
 
 pub(crate) fn gcloud_exe() -> &'static str {
-    if cfg!(windows) { "gcloud.cmd" } else { "gcloud" }
+    if cfg!(windows) {
+        "gcloud.cmd"
+    } else {
+        "gcloud"
+    }
 }
 
 fn parse_dataset_source_split(value: &str) -> std::result::Result<DatasetSourceSplit, String> {
