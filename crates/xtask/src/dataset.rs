@@ -1,6 +1,6 @@
 use crate::{
-    DatasetCommand, DatasetFetchArgs, DatasetListArgs, DatasetPrepareArgs, DatasetSourceSplit,
-    ProjectPaths, display_from_root,
+    DatasetCommand, DatasetFetchArgs, DatasetInspectArgs, DatasetListArgs, DatasetPreviewArgs,
+    DatasetPrepareArgs, DatasetSourceSplit, ProjectPaths, display_from_root,
 };
 use anyhow::{Context, Result};
 use sfx_core::manifest::{
@@ -18,6 +18,8 @@ pub(crate) fn run(command: DatasetCommand, paths: &ProjectPaths) -> Result<()> {
         DatasetCommand::List(args) => list(args, paths),
         DatasetCommand::Fetch(args) => fetch(args, paths),
         DatasetCommand::Prepare(args) => prepare(args, paths),
+        DatasetCommand::Inspect(args) => inspect(args, paths),
+        DatasetCommand::Preview(args) => preview(args, paths),
     }
 }
 
@@ -736,6 +738,351 @@ fn command_error(output: &Output) -> String {
     } else {
         stdout
     }
+}
+
+// ---------------------------------------------------------------------------
+// dataset inspect
+// ---------------------------------------------------------------------------
+
+fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
+    let dataset_config = sfx_config::load_dataset_config(&paths.root, &args.config)
+        .with_context(|| format!("loading dataset config {}", args.config.display()))?;
+
+    let manifest_path = paths.processed_sample_manifest_path();
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "processed sample manifest not found at {}\nhint: run `cargo xtask dataset prepare` first",
+            display_from_root(&paths.root, &manifest_path)
+        );
+    }
+    let manifest: ProcessedSampleManifest = read_manifest(&manifest_path)?;
+    manifest.validate()?;
+
+    let processed_dir = paths.root.join(&dataset_config.processed_dir);
+
+    println!("dataset:       {}", dataset_config.name);
+    println!("processed dir: {}", display_from_root(&paths.root, &processed_dir));
+    println!("schema:        v{}", manifest.schema_version);
+
+    if let Some(shape) = &manifest.rgb_shape {
+        let values = shape.value_count();
+        println!(
+            "rgb shape:     [{}, {}, {}]  ({} values, {} bytes/sample)",
+            shape.channels, shape.height, shape.width, values, values * 4
+        );
+    } else {
+        println!("rgb shape:     (not recorded)");
+    }
+    if let Some(shape) = &manifest.range_shape {
+        let values = shape.value_count();
+        println!(
+            "range shape:   [{}, {}, {}]  ({} values, {} bytes/sample)",
+            shape.channels, shape.height, shape.width, values, values * 4
+        );
+    } else {
+        println!("range shape:   (not recorded)");
+    }
+
+    // --- split counts ---
+    let (train_n, val_n, test_n) = manifest.samples.iter().fold(
+        (0usize, 0usize, 0usize),
+        |(tr, v, te), s| match s.meta.split {
+            sfx_core::manifest::Split::Train => (tr + 1, v, te),
+            sfx_core::manifest::Split::Val => (tr, v + 1, te),
+            sfx_core::manifest::Split::Test => (tr, v, te + 1),
+        },
+    );
+    println!();
+    println!("split counts:");
+    println!("  train: {train_n}");
+    println!("  val:   {val_n}");
+    println!("  test:  {test_n}");
+    println!("  total: {}", manifest.samples.len());
+
+    // --- tensor statistics (sampled subset) ---
+    let n = args.sample_count.min(manifest.samples.len());
+    if n == 0 {
+        return Ok(());
+    }
+    let step = (manifest.samples.len() as f64 / n as f64).ceil() as usize;
+    let sample_entries: Vec<_> = manifest.samples.iter().step_by(step).take(n).collect();
+
+    let (rgb_stats, range_stats0, range_stats1, valid_frac) =
+        compute_tensor_stats(&sample_entries, &processed_dir)?;
+
+    println!();
+    println!("rgb tensor statistics ({n} samples sampled):");
+    print_stats(&rgb_stats);
+
+    println!();
+    println!("range channel 0 (distance) statistics ({n} samples sampled):");
+    print_stats(&range_stats0);
+    println!("  valid pixels: {:.1}%", valid_frac * 100.0);
+
+    println!();
+    println!("range channel 1 (intensity) statistics ({n} samples sampled):");
+    print_stats(&range_stats1);
+
+    Ok(())
+}
+
+struct TensorStats {
+    min: f32,
+    max: f32,
+    mean: f64,
+    std: f64,
+}
+
+fn print_stats(s: &TensorStats) {
+    println!(
+        "  min: {:.4}  max: {:.4}  mean: {:.4}  std: {:.4}",
+        s.min, s.max, s.mean, s.std
+    );
+}
+
+fn compute_tensor_stats(
+    entries: &[&sfx_core::manifest::ProcessedSampleEntry],
+    processed_dir: &Path,
+) -> Result<(TensorStats, TensorStats, TensorStats, f64)> {
+    let _rgb_shape = sfx_preprocess::RGB_H * sfx_preprocess::RGB_W;
+    let range_pixels = sfx_preprocess::RANGE_H * sfx_preprocess::RANGE_W;
+
+    let mut rgb_acc = StatsAccum::new();
+    let mut range0_acc = StatsAccum::new();
+    let mut range1_acc = StatsAccum::new();
+    let mut valid_pixels: u64 = 0;
+    let mut total_range_pixels: u64 = 0;
+
+    for entry in entries {
+        let rgb_path = processed_dir.join(&entry.meta.rgb_path);
+        let bytes = std::fs::read(&rgb_path)
+            .with_context(|| format!("reading {}", rgb_path.display()))?;
+        let values = bytes_to_f32_le(&bytes);
+        for &v in &values {
+            rgb_acc.push(v);
+        }
+
+        let range_path = processed_dir.join(&entry.meta.range_path);
+        let bytes = std::fs::read(&range_path)
+            .with_context(|| format!("reading {}", range_path.display()))?;
+        let values = bytes_to_f32_le(&bytes);
+        // Channel 0: first range_pixels values
+        for i in 0..range_pixels.min(values.len()) {
+            let v = values[i];
+            range0_acc.push(v);
+            if v > 0.0 {
+                valid_pixels += 1;
+            }
+            total_range_pixels += 1;
+        }
+        // Channel 1: next range_pixels values
+        for i in range_pixels..(2 * range_pixels).min(values.len()) {
+            range1_acc.push(values[i]);
+        }
+    }
+
+    let valid_frac = if total_range_pixels > 0 {
+        valid_pixels as f64 / total_range_pixels as f64
+    } else {
+        0.0
+    };
+
+    Ok((
+        rgb_acc.finish(),
+        range0_acc.finish(),
+        range1_acc.finish(),
+        valid_frac,
+    ))
+}
+
+struct StatsAccum {
+    count: u64,
+    sum: f64,
+    sum_sq: f64,
+    min: f32,
+    max: f32,
+}
+
+impl StatsAccum {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            sum_sq: 0.0,
+            min: f32::MAX,
+            max: f32::MIN,
+        }
+    }
+
+    fn push(&mut self, v: f32) {
+        if !v.is_finite() {
+            return;
+        }
+        self.count += 1;
+        self.sum += v as f64;
+        self.sum_sq += (v as f64) * (v as f64);
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+    }
+
+    fn finish(self) -> TensorStats {
+        if self.count == 0 {
+            return TensorStats { min: 0.0, max: 0.0, mean: 0.0, std: 0.0 };
+        }
+        let mean = self.sum / self.count as f64;
+        let variance = (self.sum_sq / self.count as f64) - mean * mean;
+        TensorStats {
+            min: self.min,
+            max: self.max,
+            mean,
+            std: variance.max(0.0).sqrt(),
+        }
+    }
+}
+
+fn bytes_to_f32_le(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// dataset preview
+// ---------------------------------------------------------------------------
+
+fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
+    let dataset_config = sfx_config::load_dataset_config(&paths.root, &args.config)
+        .with_context(|| format!("loading dataset config {}", args.config.display()))?;
+
+    let manifest_path = paths.processed_sample_manifest_path();
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "processed sample manifest not found at {}\nhint: run `cargo xtask dataset prepare` first",
+            display_from_root(&paths.root, &manifest_path)
+        );
+    }
+    let manifest: ProcessedSampleManifest = read_manifest(&manifest_path)?;
+
+    let processed_dir = paths.root.join(&dataset_config.processed_dir);
+
+    // Filter by requested split string ("train", "val", "test", or "all")
+    let target_split = args.split.trim().to_ascii_lowercase();
+    let selected: Vec<_> = manifest
+        .samples
+        .iter()
+        .filter(|s| {
+            target_split == "all"
+                || matches!(
+                    (&s.meta.split, target_split.as_str()),
+                    (sfx_core::manifest::Split::Train, "train")
+                        | (sfx_core::manifest::Split::Val, "val")
+                        | (sfx_core::manifest::Split::Test, "test")
+                )
+        })
+        .take(args.count)
+        .collect();
+
+    if selected.is_empty() {
+        anyhow::bail!("no samples found for split `{}`", args.split);
+    }
+
+    let out_dir = paths.root.join(&args.out);
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating {}", out_dir.display()))?;
+
+    let cols = 4usize;
+    let rows = selected.len().div_ceil(cols);
+
+    let rgb_grid_path = out_dir.join("rgb_grid.png");
+    let range_grid_path = out_dir.join("range_grid.png");
+
+    let rgb_tile_w = sfx_preprocess::RGB_W as u32;
+    let rgb_tile_h = sfx_preprocess::RGB_H as u32;
+    let range_tile_w = sfx_preprocess::RANGE_W as u32;
+    let range_tile_h = sfx_preprocess::RANGE_H as u32;
+
+    let mut rgb_canvas = image::RgbImage::new(
+        cols as u32 * rgb_tile_w,
+        rows as u32 * rgb_tile_h,
+    );
+    let mut range_canvas = image::GrayImage::new(
+        cols as u32 * range_tile_w,
+        rows as u32 * range_tile_h,
+    );
+
+    let mut loaded = 0usize;
+    for (idx, entry) in selected.iter().enumerate() {
+        let col = (idx % cols) as u32;
+        let row = (idx / cols) as u32;
+
+        // RGB tile
+        if let Some(preview_path) = &entry.preview_rgb_path {
+            let src = processed_dir.join(preview_path);
+            if src.exists() {
+                match image::open(&src) {
+                    Ok(img) => {
+                        let tile = img.to_rgb8();
+                        let tile = image::imageops::resize(
+                            &tile,
+                            rgb_tile_w,
+                            rgb_tile_h,
+                            image::imageops::FilterType::Nearest,
+                        );
+                        image::imageops::replace(
+                            &mut rgb_canvas,
+                            &tile,
+                            (col * rgb_tile_w) as i64,
+                            (row * rgb_tile_h) as i64,
+                        );
+                        loaded += 1;
+                    }
+                    Err(e) => eprintln!("warn: could not load {}: {e}", src.display()),
+                }
+            }
+        }
+
+        // Range tile
+        if let Some(preview_path) = &entry.preview_range_path {
+            let src = processed_dir.join(preview_path);
+            if src.exists() {
+                match image::open(&src) {
+                    Ok(img) => {
+                        let tile = img.to_luma8();
+                        let tile = image::imageops::resize(
+                            &tile,
+                            range_tile_w,
+                            range_tile_h,
+                            image::imageops::FilterType::Nearest,
+                        );
+                        image::imageops::replace(
+                            &mut range_canvas,
+                            &tile,
+                            (col * range_tile_w) as i64,
+                            (row * range_tile_h) as i64,
+                        );
+                    }
+                    Err(e) => eprintln!("warn: could not load {}: {e}", src.display()),
+                }
+            }
+        }
+    }
+
+    rgb_canvas
+        .save(&rgb_grid_path)
+        .with_context(|| format!("saving {}", rgb_grid_path.display()))?;
+    range_canvas
+        .save(&range_grid_path)
+        .with_context(|| format!("saving {}", range_grid_path.display()))?;
+
+    println!("loaded {loaded} tile(s) from {} samples", selected.len());
+    println!("ok   {}", display_from_root(&paths.root, &rgb_grid_path));
+    println!("ok   {}", display_from_root(&paths.root, &range_grid_path));
+    Ok(())
 }
 
 #[cfg(test)]

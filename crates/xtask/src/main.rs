@@ -43,6 +43,8 @@ pub(crate) enum DatasetCommand {
     List(DatasetListArgs),
     Fetch(DatasetFetchArgs),
     Prepare(DatasetPrepareArgs),
+    Inspect(DatasetInspectArgs),
+    Preview(DatasetPreviewArgs),
 }
 
 #[derive(Args, Debug)]
@@ -107,6 +109,34 @@ pub(crate) struct DatasetPrepareArgs {
     pub(crate) max_frames: Option<usize>,
     #[arg(long)]
     pub(crate) inspect: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DatasetInspectArgs {
+    #[arg(long, default_value = "waymo")]
+    pub(crate) dataset: String,
+    #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
+    pub(crate) config: PathBuf,
+    /// Number of sample tensor files to load when computing statistics.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) sample_count: usize,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DatasetPreviewArgs {
+    #[arg(long, default_value = "waymo")]
+    pub(crate) dataset: String,
+    #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
+    pub(crate) config: PathBuf,
+    /// Split to source samples from.
+    #[arg(long, default_value = "train")]
+    pub(crate) split: String,
+    /// Number of samples to tile in the preview grid.
+    #[arg(long, default_value_t = 16)]
+    pub(crate) count: usize,
+    /// Output directory for grid images.
+    #[arg(long, default_value = "artifacts/previews/dataset")]
+    pub(crate) out: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
