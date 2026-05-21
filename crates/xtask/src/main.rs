@@ -1,10 +1,11 @@
+mod dataset;
 mod gcloud;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sfx_core::manifest::{
     DownloadedFileManifest, LatestRun, ProcessedSampleManifest, RawFileManifest, RunIndex,
-    SplitsManifest, read_manifest, write_manifest,
+    SourceSplit, SplitsManifest, read_manifest, write_manifest,
 };
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,10 @@ enum Command {
         #[command(subcommand)]
         command: GcloudCommand,
     },
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -33,6 +38,48 @@ pub(crate) enum GcloudCommand {
     Logout,
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum DatasetCommand {
+    List(DatasetListArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct DatasetListArgs {
+    #[arg(long, default_value = "waymo")]
+    pub(crate) dataset: String,
+    #[arg(long, value_enum, default_value_t = DatasetSourceSplit::Training)]
+    pub(crate) split: DatasetSourceSplit,
+    #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+    #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
+    pub(crate) config: PathBuf,
+    #[arg(long)]
+    pub(crate) bucket: Option<String>,
+    #[arg(long)]
+    pub(crate) prefix: Option<String>,
+    #[arg(long)]
+    pub(crate) split_prefix: Option<String>,
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum DatasetSourceSplit {
+    Training,
+    Validation,
+    Testing,
+}
+
+impl From<DatasetSourceSplit> for SourceSplit {
+    fn from(value: DatasetSourceSplit) -> Self {
+        match value {
+            DatasetSourceSplit::Training => Self::Training,
+            DatasetSourceSplit::Validation => Self::Validation,
+            DatasetSourceSplit::Testing => Self::Testing,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = ProjectPaths::discover()?;
@@ -41,6 +88,7 @@ fn main() -> Result<()> {
         Command::Init => init(&paths),
         Command::Doctor => doctor(&paths),
         Command::Gcloud { command } => gcloud::run(command, &paths),
+        Command::Dataset { command } => dataset::run(command, &paths),
     }
 }
 
@@ -128,6 +176,10 @@ impl ProjectPaths {
             self.gcloud_auth_state_path(),
             self.gcloud_token_cache_path(),
         ]
+    }
+
+    fn raw_file_manifest_path(&self) -> PathBuf {
+        self.root.join(".xtask/manifests/raw_files.json")
     }
 }
 

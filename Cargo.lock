@@ -271,6 +271,9 @@ version = "0.1.0"
 [[package]]
 name = "sfx-waymo"
 version = "0.1.0"
+dependencies = [
+ "sfx-core",
+]
 
 [[package]]
 name = "strsim"
@@ -391,6 +394,7 @@ dependencies = [
  "serde_json",
  "sfx-config",
  "sfx-core",
+ "sfx-waymo",
 ]
 
 [[package]]
