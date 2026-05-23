@@ -5,15 +5,19 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::cast::ToElement;
 use burn::tensor::{Device, Tensor, TensorData, backend::Backend};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sfx_config::ModelKind;
-use sfx_core::manifest::Split;
+use sfx_core::manifest::{
+    LatestRun, MANIFEST_SCHEMA_VERSION, RunIndex, RunIndexEntry, RunStatus, Split, read_manifest,
+    write_manifest,
+};
 use sfx_data::{BatchOptions, FusionDataset};
 use sfx_models::{
     RangeAutoencoder, RangeAutoencoderConfig, RgbAutoencoder, RgbAutoencoderConfig,
     SharedLatentMultimodalAutoencoder, SharedLatentMultimodalAutoencoderConfig,
 };
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CRATE_NAME: &str = "sfx-train";
 
@@ -24,19 +28,72 @@ pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingSummary {
+    #[serde(default)]
+    pub run_id: String,
     pub run_name: String,
+    #[serde(default)]
+    pub model_kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
     pub run_dir: PathBuf,
+    #[serde(default)]
+    pub config_path: PathBuf,
+    #[serde(default)]
+    pub dataset_config_path: PathBuf,
+    #[serde(default)]
+    pub model_config_path: PathBuf,
     pub metrics_path: PathBuf,
     pub summary_path: PathBuf,
     pub checkpoint_path: PathBuf,
+    #[serde(default)]
+    pub optimizer_path: PathBuf,
     pub epochs: usize,
     pub train_samples: usize,
     pub batch_size: usize,
+    #[serde(default)]
+    pub max_batches_per_epoch: Option<usize>,
     pub latent_dim: usize,
     pub final_train_loss: f64,
     pub backend: String,
+    #[serde(default)]
+    pub optimizer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeReport {
+    pub run_dir: PathBuf,
+    pub summary: TrainingSummary,
+    pub checkpoint_exists: bool,
+    pub metrics_exists: bool,
+    pub optimizer_metadata_exists: bool,
+    pub can_resume_optimizer_state: bool,
+    pub restart_config_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RunContext {
+    run_id: String,
+    model_kind: String,
+    started_at: String,
+    run_dir: PathBuf,
+    relative_run_dir: PathBuf,
+    metrics_path: PathBuf,
+    summary_path: PathBuf,
+    checkpoint_path: PathBuf,
+    optimizer_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OptimizerMetadata {
+    optimizer: String,
+    state_checkpoint: Option<PathBuf>,
+    note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,13 +127,13 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
     }
     train_dataset.validate_tensor_files()?;
 
-    let run_dir = root
-        .join("artifacts/checkpoints/range")
-        .join(&config.run_name);
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    copy_if_exists(config_path, &run_dir.join("config.toml"))?;
-    copy_if_exists(&config.dataset_config_path, &run_dir.join("dataset.toml"))?;
-    copy_if_exists(&config.model_config_path, &run_dir.join("model.toml"))?;
+    let run = prepare_run(
+        root,
+        ModelKind::RangeOnly,
+        &config.run_name,
+        config_path,
+        &config,
+    )?;
 
     let device = Device::<TrainBackend>::default();
     TrainBackend::seed(&device, config.seed);
@@ -84,7 +141,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         RangeAutoencoderConfig::new(config.model.latent_dim).init::<TrainBackend>(&device);
     let mut optimizer = AdamConfig::new().init::<TrainBackend, RangeAutoencoder<TrainBackend>>();
 
-    let metrics_path = run_dir.join("metrics.jsonl");
+    let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
 
@@ -130,7 +187,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         .with_context(|| format!("writing {}", metrics_path.display()))?;
 
     let valid_model = model.valid();
-    let checkpoint_stem = run_dir.join("model");
+    let checkpoint_stem = run.run_dir.join("model");
     valid_model
         .clone()
         .save_file(
@@ -143,26 +200,40 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
                 checkpoint_stem.display()
             )
         })?;
-    write_range_previews(&valid_model, &train_dataset, &run_dir.join("previews"))?;
+    write_optimizer_metadata(&run.optimizer_path, "adam")?;
+    write_range_previews(&valid_model, &train_dataset, &run.run_dir.join("previews"))?;
 
+    let completed_at = now_timestamp();
     let summary = TrainingSummary {
-        run_name: config.run_name,
-        run_dir: run_dir.clone(),
+        run_id: run.run_id.clone(),
+        run_name: run.run_id.clone(),
+        model_kind: run.model_kind.clone(),
+        status: "completed".to_string(),
+        started_at: run.started_at.clone(),
+        completed_at: Some(completed_at.clone()),
+        run_dir: run.run_dir.clone(),
+        config_path: sfx_config::resolve_from_root(root, config_path),
+        dataset_config_path: config.dataset_config_path.clone(),
+        model_config_path: config.model_config_path.clone(),
         metrics_path: metrics_path.clone(),
-        summary_path: run_dir.join("summary.json"),
-        checkpoint_path: run_dir.join("model.bin"),
+        summary_path: run.summary_path.clone(),
+        checkpoint_path: run.checkpoint_path.clone(),
+        optimizer_path: run.optimizer_path.clone(),
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
         backend: "burn-flex-autodiff".to_string(),
+        optimizer: "adam".to_string(),
     };
     std::fs::write(
         &summary.summary_path,
         format!("{}\n", serde_json::to_string_pretty(&summary)?),
     )
     .with_context(|| format!("writing {}", summary.summary_path.display()))?;
+    mark_run_completed(root, &run, &completed_at)?;
 
     Ok(summary)
 }
@@ -189,13 +260,13 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
     }
     train_dataset.validate_tensor_files()?;
 
-    let run_dir = root
-        .join("artifacts/checkpoints/rgb")
-        .join(&config.run_name);
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    copy_if_exists(config_path, &run_dir.join("config.toml"))?;
-    copy_if_exists(&config.dataset_config_path, &run_dir.join("dataset.toml"))?;
-    copy_if_exists(&config.model_config_path, &run_dir.join("model.toml"))?;
+    let run = prepare_run(
+        root,
+        ModelKind::RgbOnly,
+        &config.run_name,
+        config_path,
+        &config,
+    )?;
 
     let device = Device::<TrainBackend>::default();
     TrainBackend::seed(&device, config.seed);
@@ -203,7 +274,7 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         RgbAutoencoderConfig::new(config.model.latent_dim).init::<TrainBackend>(&device);
     let mut optimizer = AdamConfig::new().init::<TrainBackend, RgbAutoencoder<TrainBackend>>();
 
-    let metrics_path = run_dir.join("metrics.jsonl");
+    let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
 
@@ -249,7 +320,7 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         .with_context(|| format!("writing {}", metrics_path.display()))?;
 
     let valid_model = model.valid();
-    let checkpoint_stem = run_dir.join("model");
+    let checkpoint_stem = run.run_dir.join("model");
     valid_model
         .clone()
         .save_file(
@@ -262,26 +333,40 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
                 checkpoint_stem.display()
             )
         })?;
-    write_rgb_previews(&valid_model, &train_dataset, &run_dir.join("previews"))?;
+    write_optimizer_metadata(&run.optimizer_path, "adam")?;
+    write_rgb_previews(&valid_model, &train_dataset, &run.run_dir.join("previews"))?;
 
+    let completed_at = now_timestamp();
     let summary = TrainingSummary {
-        run_name: config.run_name,
-        run_dir: run_dir.clone(),
+        run_id: run.run_id.clone(),
+        run_name: run.run_id.clone(),
+        model_kind: run.model_kind.clone(),
+        status: "completed".to_string(),
+        started_at: run.started_at.clone(),
+        completed_at: Some(completed_at.clone()),
+        run_dir: run.run_dir.clone(),
+        config_path: sfx_config::resolve_from_root(root, config_path),
+        dataset_config_path: config.dataset_config_path.clone(),
+        model_config_path: config.model_config_path.clone(),
         metrics_path: metrics_path.clone(),
-        summary_path: run_dir.join("summary.json"),
-        checkpoint_path: run_dir.join("model.bin"),
+        summary_path: run.summary_path.clone(),
+        checkpoint_path: run.checkpoint_path.clone(),
+        optimizer_path: run.optimizer_path.clone(),
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
         backend: "burn-flex-autodiff".to_string(),
+        optimizer: "adam".to_string(),
     };
     std::fs::write(
         &summary.summary_path,
         format!("{}\n", serde_json::to_string_pretty(&summary)?),
     )
     .with_context(|| format!("writing {}", summary.summary_path.display()))?;
+    mark_run_completed(root, &run, &completed_at)?;
 
     Ok(summary)
 }
@@ -308,13 +393,13 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
     }
     train_dataset.validate_tensor_files()?;
 
-    let run_dir = root
-        .join("artifacts/checkpoints/fusion")
-        .join(&config.run_name);
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
-    copy_if_exists(config_path, &run_dir.join("config.toml"))?;
-    copy_if_exists(&config.dataset_config_path, &run_dir.join("dataset.toml"))?;
-    copy_if_exists(&config.model_config_path, &run_dir.join("model.toml"))?;
+    let run = prepare_run(
+        root,
+        ModelKind::Fusion,
+        &config.run_name,
+        config_path,
+        &config,
+    )?;
 
     let device = Device::<TrainBackend>::default();
     TrainBackend::seed(&device, config.seed);
@@ -326,7 +411,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
     let mut optimizer =
         AdamConfig::new().init::<TrainBackend, SharedLatentMultimodalAutoencoder<TrainBackend>>();
 
-    let metrics_path = run_dir.join("metrics.jsonl");
+    let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
     let total_batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
@@ -396,7 +481,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         .with_context(|| format!("writing {}", metrics_path.display()))?;
 
     let valid_model = model.valid();
-    let checkpoint_stem = run_dir.join("model");
+    let checkpoint_stem = run.run_dir.join("model");
     valid_model
         .clone()
         .save_file(
@@ -409,32 +494,227 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
                 checkpoint_stem.display()
             )
         })?;
-    write_fusion_previews(&valid_model, &train_dataset, &run_dir.join("previews"))?;
+    write_optimizer_metadata(&run.optimizer_path, "adam")?;
+    write_fusion_previews(&valid_model, &train_dataset, &run.run_dir.join("previews"))?;
 
+    let completed_at = now_timestamp();
     let summary = TrainingSummary {
-        run_name: config.run_name,
-        run_dir: run_dir.clone(),
+        run_id: run.run_id.clone(),
+        run_name: run.run_id.clone(),
+        model_kind: run.model_kind.clone(),
+        status: "completed".to_string(),
+        started_at: run.started_at.clone(),
+        completed_at: Some(completed_at.clone()),
+        run_dir: run.run_dir.clone(),
+        config_path: sfx_config::resolve_from_root(root, config_path),
+        dataset_config_path: config.dataset_config_path.clone(),
+        model_config_path: config.model_config_path.clone(),
         metrics_path: metrics_path.clone(),
-        summary_path: run_dir.join("summary.json"),
-        checkpoint_path: run_dir.join("model.bin"),
+        summary_path: run.summary_path.clone(),
+        checkpoint_path: run.checkpoint_path.clone(),
+        optimizer_path: run.optimizer_path.clone(),
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
         backend: "burn-flex-autodiff".to_string(),
+        optimizer: "adam".to_string(),
     };
     std::fs::write(
         &summary.summary_path,
         format!("{}\n", serde_json::to_string_pretty(&summary)?),
     )
     .with_context(|| format!("writing {}", summary.summary_path.display()))?;
+    mark_run_completed(root, &run, &completed_at)?;
 
     Ok(summary)
 }
 
+pub fn inspect_resume_run(root: &Path, run_path: &Path) -> Result<ResumeReport> {
+    let run_dir = sfx_config::resolve_from_root(root, run_path);
+    let summary_path = run_dir.join("summary.json");
+    let summary_text = std::fs::read_to_string(&summary_path)
+        .with_context(|| format!("reading {}", summary_path.display()))?;
+    let mut summary: TrainingSummary = serde_json::from_str(&summary_text)
+        .with_context(|| format!("parsing {}", summary_path.display()))?;
+    if summary.run_id.is_empty() {
+        summary.run_id = run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown-run")
+            .to_string();
+    }
+    if summary.run_name.is_empty() {
+        summary.run_name = summary.run_id.clone();
+    }
+
+    let checkpoint_path = if summary.checkpoint_path.as_os_str().is_empty() {
+        run_dir.join("model.bin")
+    } else {
+        summary.checkpoint_path.clone()
+    };
+    let metrics_path = if summary.metrics_path.as_os_str().is_empty() {
+        run_dir.join("metrics.jsonl")
+    } else {
+        summary.metrics_path.clone()
+    };
+    let optimizer_path = if summary.optimizer_path.as_os_str().is_empty() {
+        run_dir.join("optimizer.json")
+    } else {
+        summary.optimizer_path.clone()
+    };
+    let run_config_path = run_dir.join("config.toml");
+    let restart_config_path = if run_config_path.exists() {
+        run_config_path
+    } else if summary.config_path.as_os_str().is_empty() {
+        run_dir.join("config.toml")
+    } else {
+        summary.config_path.clone()
+    };
+
+    Ok(ResumeReport {
+        run_dir,
+        summary,
+        checkpoint_exists: checkpoint_path.exists(),
+        metrics_exists: metrics_path.exists(),
+        optimizer_metadata_exists: optimizer_path.exists(),
+        can_resume_optimizer_state: false,
+        restart_config_path,
+    })
+}
+
 fn mse_loss<B: Backend>(pred: Tensor<B, 4>, target: Tensor<B, 4>) -> Tensor<B, 1> {
     (pred - target).square().mean()
+}
+
+fn prepare_run(
+    root: &Path,
+    kind: ModelKind,
+    requested_run_name: &str,
+    config_path: &Path,
+    config: &sfx_config::TrainingConfig,
+) -> Result<RunContext> {
+    let model_kind = model_kind_slug(kind).to_string();
+    let run_id = allocate_run_id(root, &model_kind, requested_run_name)?;
+    let relative_run_dir = PathBuf::from("artifacts/checkpoints")
+        .join(&model_kind)
+        .join(&run_id);
+    let run_dir = root.join(&relative_run_dir);
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
+    copy_if_exists(config_path, &run_dir.join("config.toml"))?;
+    copy_if_exists(&config.dataset_config_path, &run_dir.join("dataset.toml"))?;
+    copy_if_exists(&config.model_config_path, &run_dir.join("model.toml"))?;
+
+    let run = RunContext {
+        run_id,
+        model_kind,
+        started_at: now_timestamp(),
+        metrics_path: run_dir.join("metrics.jsonl"),
+        summary_path: run_dir.join("summary.json"),
+        checkpoint_path: run_dir.join("model.bin"),
+        optimizer_path: run_dir.join("optimizer.json"),
+        run_dir,
+        relative_run_dir,
+    };
+    upsert_run_status(root, &run, RunStatus::Running, None)?;
+    Ok(run)
+}
+
+fn allocate_run_id(root: &Path, model_kind: &str, requested_run_name: &str) -> Result<String> {
+    let base_dir = root.join("artifacts/checkpoints").join(model_kind);
+    std::fs::create_dir_all(&base_dir)
+        .with_context(|| format!("creating {}", base_dir.display()))?;
+    if run_slot_available(&base_dir.join(requested_run_name))? {
+        return Ok(requested_run_name.to_string());
+    }
+
+    for index in 2..10_000 {
+        let candidate = format!("{requested_run_name}_{index:03}");
+        if run_slot_available(&base_dir.join(&candidate))? {
+            return Ok(candidate);
+        }
+    }
+
+    bail!("could not allocate a free run directory for {requested_run_name}")
+}
+
+fn run_slot_available(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    let mut entries = std::fs::read_dir(path)
+        .with_context(|| format!("checking whether {} is empty", path.display()))?;
+    Ok(entries.next().is_none())
+}
+
+fn mark_run_completed(root: &Path, run: &RunContext, completed_at: &str) -> Result<()> {
+    upsert_run_status(
+        root,
+        run,
+        RunStatus::Completed,
+        Some(completed_at.to_string()),
+    )?;
+    let latest = LatestRun {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        run_id: Some(run.run_id.clone()),
+        path: Some(run.relative_run_dir.clone()),
+    };
+    write_manifest(root.join(".xtask/runs/latest.json"), &latest).context("writing latest run")
+}
+
+fn upsert_run_status(
+    root: &Path,
+    run: &RunContext,
+    status: RunStatus,
+    completed_at: Option<String>,
+) -> Result<()> {
+    let path = root.join(".xtask/runs/run_index.json");
+    let mut index = if path.exists() {
+        read_manifest::<RunIndex>(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        RunIndex::default()
+    };
+    index.runs.retain(|entry| entry.run_id != run.run_id);
+    index.runs.push(RunIndexEntry {
+        run_id: run.run_id.clone(),
+        model_kind: run.model_kind.clone(),
+        path: run.relative_run_dir.clone(),
+        status,
+        started_at: Some(run.started_at.clone()),
+        completed_at,
+    });
+    write_manifest(&path, &index).with_context(|| format!("writing {}", path.display()))
+}
+
+fn write_optimizer_metadata(path: &Path, optimizer: &str) -> Result<()> {
+    let metadata = OptimizerMetadata {
+        optimizer: optimizer.to_string(),
+        state_checkpoint: None,
+        note: "Optimizer state serialization is not yet supported by this prototype; restart from the saved config and model checkpoint instead.".to_string(),
+    };
+    let text = serde_json::to_string_pretty(&metadata)?;
+    std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+fn now_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("unix:{seconds}")
+}
+
+fn model_kind_slug(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::RgbOnly => "rgb",
+        ModelKind::RangeOnly => "range",
+        ModelKind::Fusion => "fusion",
+    }
 }
 
 fn copy_if_exists(source: &Path, target: &Path) -> Result<()> {

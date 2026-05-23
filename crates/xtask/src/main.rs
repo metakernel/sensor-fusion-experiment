@@ -145,6 +145,19 @@ pub(crate) struct DatasetPreviewArgs {
 pub(crate) struct TrainArgs {
     #[arg(long, default_value = "configs/train.range-only.toml")]
     pub(crate) config: PathBuf,
+    #[command(subcommand)]
+    pub(crate) command: Option<TrainSubcommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum TrainSubcommand {
+    Resume(TrainResumeArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TrainResumeArgs {
+    #[arg(long)]
+    pub(crate) run: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
