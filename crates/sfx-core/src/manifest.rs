@@ -297,11 +297,94 @@ impl ProcessedSampleManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionSummaryManifest {
+    pub schema_version: u32,
+    pub dataset: Option<String>,
+    pub files: Vec<ExtractionSummaryEntry>,
+}
+
+impl Default for ExtractionSummaryManifest {
+    fn default() -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            dataset: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+impl ExtractionSummaryManifest {
+    pub fn validate(&self) -> Result<()> {
+        validate_schema("extraction_summary", self.schema_version)?;
+        validate_optional_name("extraction_summary", "dataset", self.dataset.as_deref())?;
+        for (index, file) in self.files.iter().enumerate() {
+            let label = format!("files[{index}]");
+            validate_path(
+                "extraction_summary",
+                &format!("{label}.camera_parquet_path"),
+                &file.camera_parquet_path,
+            )?;
+            validate_path(
+                "extraction_summary",
+                &format!("{label}.lidar_parquet_path"),
+                &file.lidar_parquet_path,
+            )?;
+            ensure(
+                "extraction_summary",
+                file.matched_pairs <= file.camera_frames,
+                format!(
+                    "{label}.matched_pairs cannot exceed camera_frames ({} > {})",
+                    file.matched_pairs, file.camera_frames
+                ),
+            )?;
+            ensure(
+                "extraction_summary",
+                file.matched_pairs <= file.lidar_frames,
+                format!(
+                    "{label}.matched_pairs cannot exceed lidar_frames ({} > {})",
+                    file.matched_pairs, file.lidar_frames
+                ),
+            )?;
+            if let Some(id) = &file.first_sample_id {
+                validate_sample_id(
+                    "extraction_summary",
+                    &format!("{label}.first_sample_id"),
+                    id,
+                )?;
+            }
+            if let Some(id) = &file.last_sample_id {
+                validate_sample_id(
+                    "extraction_summary",
+                    &format!("{label}.last_sample_id"),
+                    id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessedSampleEntry {
     pub meta: MultimodalSampleMeta,
     pub meta_path: PathBuf,
     pub preview_rgb_path: Option<PathBuf>,
     pub preview_range_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionSummaryEntry {
+    pub split: Split,
+    pub camera_parquet_path: PathBuf,
+    pub lidar_parquet_path: PathBuf,
+    pub camera_frames: usize,
+    pub lidar_frames: usize,
+    pub matched_pairs: usize,
+    pub unmatched_camera: usize,
+    pub unmatched_lidar: usize,
+    pub max_abs_timestamp_delta_micros: i64,
+    pub first_sample_id: Option<SampleId>,
+    pub last_sample_id: Option<SampleId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +648,30 @@ mod tests {
         let err = manifest.validate().unwrap_err();
 
         assert!(err.to_string().contains("rgb_shape.channels"));
+    }
+
+    #[test]
+    fn extraction_summary_rejects_invalid_match_counts() {
+        let manifest = ExtractionSummaryManifest {
+            files: vec![ExtractionSummaryEntry {
+                split: Split::Train,
+                camera_parquet_path: PathBuf::from("training/camera_image/a.parquet"),
+                lidar_parquet_path: PathBuf::from("training/lidar/a.parquet"),
+                camera_frames: 1,
+                lidar_frames: 1,
+                matched_pairs: 2,
+                unmatched_camera: 0,
+                unmatched_lidar: 0,
+                max_abs_timestamp_delta_micros: 0,
+                first_sample_id: None,
+                last_sample_id: None,
+            }],
+            ..ExtractionSummaryManifest::default()
+        };
+
+        let err = manifest.validate().unwrap_err();
+
+        assert!(err.to_string().contains("matched_pairs cannot exceed camera_frames"));
     }
 
     fn temp_root(name: &str) -> PathBuf {

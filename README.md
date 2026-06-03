@@ -35,7 +35,7 @@ cargo xtask dataset fetch --splits train,val --train-files 1 --val-files 1
 - `cargo xtask gcloud logout`: revoke application-default credentials and remove local credential files.
 - `cargo xtask dataset list`: list Waymo Cloud Storage objects for one source split and write `.xtask/manifests/raw_files.json`.
 - `cargo xtask dataset fetch`: download selected Waymo objects into split-specific raw data folders and write `.xtask/manifests/downloaded_files.json`.
-- `cargo xtask dataset prepare`: extract and align camera/lidar frames from matched parquet files, then write processed samples plus manifests.
+- `cargo xtask dataset prepare`: extract and align camera/lidar frames from matched parquet files, then write processed samples, extraction summaries, and manifests.
 
 ## License
 

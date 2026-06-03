@@ -5,8 +5,8 @@ mod train;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sfx_core::manifest::{
-    DownloadedFileManifest, LatestRun, ProcessedSampleManifest, RawFileManifest, RunIndex,
-    SourceSplit, SplitsManifest, read_manifest, write_manifest,
+    DownloadedFileManifest, ExtractionSummaryManifest, LatestRun, ProcessedSampleManifest,
+    RawFileManifest, RunIndex, SourceSplit, SplitsManifest, read_manifest, write_manifest,
 };
 use std::path::{Path, PathBuf};
 
@@ -265,6 +265,10 @@ impl ProjectPaths {
                 ".xtask/manifests/processed_samples.json",
                 ManifestKind::ProcessedSamples,
             ),
+            ManifestFile::new(
+                ".xtask/manifests/extraction_summary.json",
+                ManifestKind::ExtractionSummary,
+            ),
             ManifestFile::new(".xtask/manifests/splits.json", ManifestKind::Splits),
             ManifestFile::new(".xtask/runs/run_index.json", ManifestKind::RunIndex),
             ManifestFile::new(".xtask/runs/latest.json", ManifestKind::LatestRun),
@@ -313,6 +317,10 @@ impl ProjectPaths {
         self.root.join(".xtask/manifests/processed_samples.json")
     }
 
+    pub(crate) fn extraction_summary_manifest_path(&self) -> PathBuf {
+        self.root.join(".xtask/manifests/extraction_summary.json")
+    }
+
     pub(crate) fn splits_manifest_path(&self) -> PathBuf {
         self.root.join(".xtask/manifests/splits.json")
     }
@@ -334,6 +342,7 @@ enum ManifestKind {
     RawFiles,
     DownloadedFiles,
     ProcessedSamples,
+    ExtractionSummary,
     Splits,
     RunIndex,
     LatestRun,
@@ -345,6 +354,7 @@ impl ManifestKind {
             Self::RawFiles => write_manifest(path, &RawFileManifest::default()),
             Self::DownloadedFiles => write_manifest(path, &DownloadedFileManifest::default()),
             Self::ProcessedSamples => write_manifest(path, &ProcessedSampleManifest::default()),
+            Self::ExtractionSummary => write_manifest(path, &ExtractionSummaryManifest::default()),
             Self::Splits => write_manifest(path, &SplitsManifest::default()),
             Self::RunIndex => write_manifest(path, &RunIndex::default()),
             Self::LatestRun => write_manifest(path, &LatestRun::default()),
@@ -356,6 +366,7 @@ impl ManifestKind {
             Self::RawFiles => read_manifest::<RawFileManifest>(path)?.validate(),
             Self::DownloadedFiles => read_manifest::<DownloadedFileManifest>(path)?.validate(),
             Self::ProcessedSamples => read_manifest::<ProcessedSampleManifest>(path)?.validate(),
+            Self::ExtractionSummary => read_manifest::<ExtractionSummaryManifest>(path)?.validate(),
             Self::Splits => read_manifest::<SplitsManifest>(path)?.validate(),
             Self::RunIndex => read_manifest::<RunIndex>(path)?.validate(),
             Self::LatestRun => read_manifest::<LatestRun>(path)?.validate(),

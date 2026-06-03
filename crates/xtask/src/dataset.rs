@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{Context, Result};
 use sfx_core::manifest::{
     DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, MANIFEST_SCHEMA_VERSION,
-    ProcessedSampleManifest, RawFileEntry, RawFileManifest, SourceSplit, Split, SplitsManifest,
-    read_manifest, write_manifest,
+    ExtractionSummaryEntry, ExtractionSummaryManifest, ProcessedSampleManifest, RawFileEntry,
+    RawFileManifest, SourceSplit, Split, SplitsManifest, read_manifest, write_manifest,
 };
 use sfx_waymo::{DiscoveryConfig, parse_gcloud_storage_listing, split_label};
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,6 +236,7 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
         .unwrap_or(dataset_config.raw_dir.clone());
 
     let mut all_entries: Vec<sfx_core::manifest::ProcessedSampleEntry> = Vec::new();
+    let mut extraction_entries = Vec::new();
     let mut train_ids = Vec::new();
     let mut val_ids = Vec::new();
     let mut test_ids = Vec::new();
@@ -342,6 +343,10 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 );
             }
 
+            let first_sample_id = pairs
+                .first()
+                .map(|_| sfx_core::manifest::SampleId(format!("sample_{sample_counter:06}")));
+
             for pair in &pairs {
                 let entry = sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
                 let id = entry.meta.id.clone();
@@ -353,6 +358,29 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 }
                 sample_counter += 1;
             }
+
+            let last_sample_id = if sample_counter == 0 || pairs.is_empty() {
+                None
+            } else {
+                Some(sfx_core::manifest::SampleId(format!(
+                    "sample_{:06}",
+                    sample_counter - 1
+                )))
+            };
+
+            extraction_entries.push(ExtractionSummaryEntry {
+                split: split.clone(),
+                camera_parquet_path: manifest_local_path(&paths.root, &cam_path),
+                lidar_parquet_path: manifest_local_path(&paths.root, &lid_path),
+                camera_frames: align_stats.camera_frames,
+                lidar_frames: align_stats.lidar_frames,
+                matched_pairs: align_stats.matched_pairs,
+                unmatched_camera: align_stats.unmatched_camera,
+                unmatched_lidar: align_stats.unmatched_lidar,
+                max_abs_timestamp_delta_micros: align_stats.max_abs_timestamp_delta_micros,
+                first_sample_id,
+                last_sample_id,
+            });
 
             println!("  ok   wrote {} samples", pairs.len());
         }
@@ -383,6 +411,19 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
     println!(
         "ok   {}",
         display_from_root(&paths.root, &sample_manifest_path)
+    );
+
+    let extraction_summary = ExtractionSummaryManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        dataset: Some(dataset_config.name.clone()),
+        files: extraction_entries,
+    };
+    extraction_summary.validate()?;
+    let extraction_summary_path = paths.extraction_summary_manifest_path();
+    write_manifest(&extraction_summary_path, &extraction_summary)?;
+    println!(
+        "ok   {}",
+        display_from_root(&paths.root, &extraction_summary_path)
     );
 
     let splits_manifest = SplitsManifest {
@@ -1264,6 +1305,19 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, PathBuf::from("raw/training/camera_image/b.parquet"));
         assert_eq!(pairs[0].1, PathBuf::from("raw/training/lidar/b.parquet"));
+    }
+
+    #[test]
+    fn manifest_local_path_strips_workspace_root() {
+        let root = PathBuf::from("D:/repos/sensor-fusion-experiment");
+        let path = root.join("data/raw/waymo/training/camera_image/a.parquet");
+
+        let local = manifest_local_path(&root, &path);
+
+        assert_eq!(
+            local,
+            PathBuf::from("data/raw/waymo/training/camera_image/a.parquet")
+        );
     }
 
     fn fetch_args(splits: Vec<DatasetSourceSplit>) -> DatasetFetchArgs {
