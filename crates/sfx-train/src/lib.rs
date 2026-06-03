@@ -103,6 +103,10 @@ struct EpochMetric {
     epoch: usize,
     train_loss: f64,
     val_loss: Option<f64>,
+    rgb_train_loss: Option<f64>,
+    range_train_loss: Option<f64>,
+    rgb_val_loss: Option<f64>,
+    range_val_loss: Option<f64>,
     sample_count: usize,
     batch_count: usize,
 }
@@ -112,7 +116,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         .with_context(|| format!("loading training config {}", config_path.display()))?;
     if config.model.kind != ModelKind::RangeOnly {
         bail!(
-            "Phase 10 only supports range-only training; config uses {:?}",
+            "range training requires model kind `range-only`; config uses {:?}",
             config.model.kind
         );
     }
@@ -202,6 +206,10 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
             epoch,
             train_loss: final_train_loss,
             val_loss,
+            rgb_train_loss: None,
+            range_train_loss: None,
+            rgb_val_loss: None,
+            range_val_loss: None,
             sample_count: total_samples,
             batch_count,
         };
@@ -296,12 +304,78 @@ fn evaluate_range_autoencoder(
     Ok(Some(total_loss / total_samples.max(1) as f64))
 }
 
+fn evaluate_rgb_autoencoder(
+    model: &RgbAutoencoder<InnerBackend>,
+    dataset: &FusionDataset,
+    batch_size: usize,
+) -> Result<Option<f64>> {
+    if dataset.is_empty() {
+        return Ok(None);
+    }
+
+    let device = Device::<InnerBackend>::default();
+    let mut total_loss = 0.0f64;
+    let mut total_samples = 0usize;
+
+    for batch in dataset.batches(BatchOptions::new(batch_size))? {
+        let batch = batch?.into_burn::<InnerBackend>(&device);
+        let current_batch_size = batch.batch_size();
+        let target = batch.rgb.clone();
+        let output = model.forward(batch.rgb);
+        let loss = mse_loss(output.rgb_hat, target);
+        let loss_value = loss.into_scalar().to_f64();
+        total_loss += loss_value * current_batch_size as f64;
+        total_samples += current_batch_size;
+    }
+
+    Ok(Some(total_loss / total_samples.max(1) as f64))
+}
+
+fn evaluate_fusion_autoencoder(
+    model: &SharedLatentMultimodalAutoencoder<InnerBackend>,
+    dataset: &FusionDataset,
+    batch_size: usize,
+) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+    if dataset.is_empty() {
+        return Ok((None, None, None));
+    }
+
+    let device = Device::<InnerBackend>::default();
+    let mut total_loss = 0.0f64;
+    let mut total_rgb_loss = 0.0f64;
+    let mut total_range_loss = 0.0f64;
+    let mut total_samples = 0usize;
+
+    for batch in dataset.batches(BatchOptions::new(batch_size))? {
+        let batch = batch?.into_burn::<InnerBackend>(&device);
+        let current_batch_size = batch.batch_size();
+        let rgb_target = batch.rgb.clone();
+        let range_target = batch.range.clone();
+        let output = model.forward(batch.rgb, batch.range);
+        let rgb_loss = mse_loss(output.rgb_hat, rgb_target);
+        let range_loss = mse_loss(output.range_hat, range_target);
+        let rgb_loss_value = rgb_loss.into_scalar().to_f64();
+        let range_loss_value = range_loss.into_scalar().to_f64();
+        total_rgb_loss += rgb_loss_value * current_batch_size as f64;
+        total_range_loss += range_loss_value * current_batch_size as f64;
+        total_loss += (rgb_loss_value + range_loss_value) * current_batch_size as f64;
+        total_samples += current_batch_size;
+    }
+
+    let denom = total_samples.max(1) as f64;
+    Ok((
+        Some(total_loss / denom),
+        Some(total_rgb_loss / denom),
+        Some(total_range_loss / denom),
+    ))
+}
+
 pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<TrainingSummary> {
     let config = sfx_config::load_training_config(root, config_path)
         .with_context(|| format!("loading training config {}", config_path.display()))?;
     if config.model.kind != ModelKind::RgbOnly {
         bail!(
-            "Phase 11 only supports RGB-only training; config uses {:?}",
+            "rgb training requires model kind `rgb-only`; config uses {:?}",
             config.model.kind
         );
     }
@@ -317,6 +391,15 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         bail!("training split is empty; run `cargo xtask dataset prepare --splits train` first");
     }
     train_dataset.validate_tensor_files()?;
+    let val_dataset = FusionDataset::open_split(
+        &config.dataset.processed_dir,
+        &manifest_path,
+        Some(Split::Val),
+    )
+    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    if !val_dataset.is_empty() {
+        val_dataset.validate_tensor_files()?;
+    }
 
     let run = prepare_run(
         root,
@@ -335,6 +418,20 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
     let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
+    let mut final_val_loss = None;
+    let total_batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
+    let batches_per_epoch = config
+        .max_batches_per_epoch
+        .unwrap_or(total_batches_per_epoch)
+        .min(total_batches_per_epoch);
+    println!(
+        "rgb training: samples={} val_samples={} batch_size={} batches/epoch={} epochs={}",
+        train_dataset.len(),
+        val_dataset.len(),
+        config.batch_size,
+        batches_per_epoch,
+        config.epochs
+    );
 
     for epoch in 1..=config.epochs {
         let options = BatchOptions::new(config.batch_size).shuffled(config.seed + epoch as u64);
@@ -356,13 +453,22 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
             total_loss += loss_value * current_batch_size as f64;
             total_samples += current_batch_size;
             batch_count += 1;
+            if batch_count >= batches_per_epoch {
+                break;
+            }
         }
 
         final_train_loss = total_loss / total_samples.max(1) as f64;
+        let val_loss = evaluate_rgb_autoencoder(&model.valid(), &val_dataset, config.batch_size)?;
+        final_val_loss = val_loss;
         let metric = EpochMetric {
             epoch,
             train_loss: final_train_loss,
-            val_loss: None,
+            val_loss,
+            rgb_train_loss: None,
+            range_train_loss: None,
+            rgb_val_loss: None,
+            range_val_loss: None,
             sample_count: total_samples,
             batch_count,
         };
@@ -416,7 +522,7 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
-        final_val_loss: None,
+        final_val_loss,
         backend: "burn-flex-autodiff".to_string(),
         optimizer: "adam".to_string(),
     };
@@ -435,7 +541,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         .with_context(|| format!("loading training config {}", config_path.display()))?;
     if config.model.kind != ModelKind::Fusion {
         bail!(
-            "Phase 12 only supports fusion training; config uses {:?}",
+            "fusion training requires model kind `fusion`; config uses {:?}",
             config.model.kind
         );
     }
@@ -451,6 +557,15 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         bail!("training split is empty; run `cargo xtask dataset prepare --splits train` first");
     }
     train_dataset.validate_tensor_files()?;
+    let val_dataset = FusionDataset::open_split(
+        &config.dataset.processed_dir,
+        &manifest_path,
+        Some(Split::Val),
+    )
+    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    if !val_dataset.is_empty() {
+        val_dataset.validate_tensor_files()?;
+    }
 
     let run = prepare_run(
         root,
@@ -473,14 +588,16 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
     let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
+    let mut final_val_loss = None;
     let total_batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
     let batches_per_epoch = config
         .max_batches_per_epoch
         .unwrap_or(total_batches_per_epoch)
         .min(total_batches_per_epoch);
     println!(
-        "fusion training: samples={} batch_size={} batches/epoch={} epochs={}",
+        "fusion training: samples={} val_samples={} batch_size={} batches/epoch={} epochs={}",
         train_dataset.len(),
+        val_dataset.len(),
         config.batch_size,
         batches_per_epoch,
         config.epochs
@@ -489,6 +606,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
     for epoch in 1..=config.epochs {
         let options = BatchOptions::new(config.batch_size).shuffled(config.seed + epoch as u64);
         let mut total_loss = 0.0f64;
+        let mut total_rgb_loss = 0.0f64;
+        let mut total_range_loss = 0.0f64;
         let mut total_samples = 0usize;
         let mut batch_count = 0usize;
 
@@ -507,6 +626,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
             let output = model.forward(batch.rgb, batch.range);
             let rgb_loss = mse_loss(output.rgb_hat, rgb_target);
             let range_loss = mse_loss(output.range_hat, range_target);
+            let rgb_loss_value = rgb_loss.clone().into_scalar().to_f64();
+            let range_loss_value = range_loss.clone().into_scalar().to_f64();
             let loss = rgb_loss + range_loss;
             let loss_value = loss.clone().into_scalar().to_f64();
 
@@ -514,6 +635,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
             model = optimizer.step(config.learning_rate as f64, model, grads);
 
             total_loss += loss_value * current_batch_size as f64;
+            total_rgb_loss += rgb_loss_value * current_batch_size as f64;
+            total_range_loss += range_loss_value * current_batch_size as f64;
             total_samples += current_batch_size;
             if batch_count >= batches_per_epoch {
                 break;
@@ -521,18 +644,27 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         }
 
         final_train_loss = total_loss / total_samples.max(1) as f64;
+        let rgb_train_loss = total_rgb_loss / total_samples.max(1) as f64;
+        let range_train_loss = total_range_loss / total_samples.max(1) as f64;
+        let (val_loss, rgb_val_loss, range_val_loss) =
+            evaluate_fusion_autoencoder(&model.valid(), &val_dataset, config.batch_size)?;
+        final_val_loss = val_loss;
         let metric = EpochMetric {
             epoch,
             train_loss: final_train_loss,
-            val_loss: None,
+            val_loss,
+            rgb_train_loss: Some(rgb_train_loss),
+            range_train_loss: Some(range_train_loss),
+            rgb_val_loss,
+            range_val_loss,
             sample_count: total_samples,
             batch_count,
         };
         metric_lines.push_str(&serde_json::to_string(&metric)?);
         metric_lines.push('\n');
         println!(
-            "epoch {epoch:03}/{:03} train_loss={:.6} batches={batch_count}",
-            config.epochs, final_train_loss
+            "epoch {epoch:03}/{:03} train_loss={:.6} rgb={:.6} range={:.6} batches={batch_count}",
+            config.epochs, final_train_loss, rgb_train_loss, range_train_loss
         );
     }
 
@@ -578,7 +710,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
-        final_val_loss: None,
+        final_val_loss,
         backend: "burn-flex-autodiff".to_string(),
         optimizer: "adam".to_string(),
     };
