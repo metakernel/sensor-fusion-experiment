@@ -13,6 +13,49 @@ pub const RANGE_CHANNELS: usize = 2;
 /// Physical max range in metres used for normalisation.
 const MAX_RANGE_METERS: f32 = 75.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeChannel {
+    Range,
+    Intensity,
+    ValidityMask,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessOptions {
+    pub rgb_height: usize,
+    pub rgb_width: usize,
+    pub range_height: usize,
+    pub range_width: usize,
+    pub range_channels: Vec<RangeChannel>,
+}
+
+impl Default for ProcessOptions {
+    fn default() -> Self {
+        Self {
+            rgb_height: RGB_H,
+            rgb_width: RGB_W,
+            range_height: RANGE_H,
+            range_width: RANGE_W,
+            range_channels: vec![RangeChannel::Range, RangeChannel::Intensity],
+        }
+    }
+}
+
+impl ProcessOptions {
+    fn validate(&self) -> Result<()> {
+        if self.rgb_height == 0 || self.rgb_width == 0 {
+            anyhow::bail!("rgb size must be greater than zero");
+        }
+        if self.range_height == 0 || self.range_width == 0 {
+            anyhow::bail!("range size must be greater than zero");
+        }
+        if self.range_channels.is_empty() {
+            anyhow::bail!("range_channels must contain at least one channel");
+        }
+        Ok(())
+    }
+}
+
 pub struct ExtractedPair {
     pub segment: String,
     pub timestamp_micros: i64,
@@ -156,6 +199,18 @@ pub fn write_sample(
     split: &Split,
     sample_idx: usize,
 ) -> Result<ProcessedSampleEntry> {
+    write_sample_with_options(output_dir, pair, split, sample_idx, &ProcessOptions::default())
+}
+
+pub fn write_sample_with_options(
+    output_dir: &Path,
+    pair: &ExtractedPair,
+    split: &Split,
+    sample_idx: usize,
+    options: &ProcessOptions,
+) -> Result<ProcessedSampleEntry> {
+    options.validate()?;
+
     let sample_id = format!("sample_{sample_idx:06}");
     let sample_dir = output_dir.join(split_dir(split)).join(&sample_id);
     std::fs::create_dir_all(&sample_dir)
@@ -168,22 +223,29 @@ pub fn write_sample(
     let preview_range_path = sample_dir.join("preview_range.png");
 
     // --- RGB: decode JPEG → resize [H, W] → normalise → CHW f32 binary ---
-    let rgb_chw = process_rgb(&pair.jpeg_bytes, RGB_H, RGB_W).context("processing RGB frame")?;
+    let rgb_chw =
+        process_rgb(&pair.jpeg_bytes, options.rgb_height, options.rgb_width).context("processing RGB frame")?;
     let rgb_bytes: Vec<u8> = rgb_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&rgb_path, &rgb_bytes)
         .with_context(|| format!("writing {}", rgb_path.display()))?;
 
-    write_rgb_preview(&rgb_chw, RGB_H, RGB_W, &preview_rgb_path)
+    write_rgb_preview(&rgb_chw, options.rgb_height, options.rgb_width, &preview_rgb_path)
         .with_context(|| format!("writing {}", preview_rgb_path.display()))?;
 
     // --- Range: extract channels [0,1] → resize width → normalise → CHW f32 binary ---
-    let range_chw = process_range(&pair.range_values, &pair.range_shape, RANGE_H, RANGE_W)
-        .context("processing range frame")?;
+    let range_chw = process_range(
+        &pair.range_values,
+        &pair.range_shape,
+        options.range_height,
+        options.range_width,
+        &options.range_channels,
+    )
+    .context("processing range frame")?;
     let range_bytes: Vec<u8> = range_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&range_path, &range_bytes)
         .with_context(|| format!("writing {}", range_path.display()))?;
 
-    write_range_preview(&range_chw, RANGE_H, RANGE_W, &preview_range_path)
+    write_range_preview(&range_chw, options.range_height, options.range_width, &preview_range_path)
         .with_context(|| format!("writing {}", preview_range_path.display()))?;
 
     let meta = MultimodalSampleMeta {
@@ -227,59 +289,96 @@ fn process_rgb(jpeg: &[u8], h: usize, w: usize) -> Result<Vec<f32>> {
 
 /// Extract channels `[0, 1]` from raw LiDAR range image `[H_src, W_src, C_src]`,
 /// resize width to `W_target`, normalise, return CHW `[2, H, W]`.
-fn process_range(values: &[f32], shape: &[usize; 3], h: usize, w: usize) -> Result<Vec<f32>> {
+fn process_range(
+    values: &[f32],
+    shape: &[usize; 3],
+    h: usize,
+    w: usize,
+    channels: &[RangeChannel],
+) -> Result<Vec<f32>> {
     let [h_src, w_src, c_src] = *shape;
     if h_src == 0 || w_src == 0 || c_src == 0 {
         anyhow::bail!("invalid range shape {h_src}×{w_src}×{c_src}");
     }
-    if h_src != h {
-        anyhow::bail!("range height {h_src} != expected {h}");
-    }
     if c_src < 2 {
         anyhow::bail!("range image has only {c_src} channel(s); need at least 2");
     }
+    if channels.is_empty() {
+        anyhow::bail!("at least one range channel is required");
+    }
 
-    // Bilinear resize in width dimension only (height already matches).
-    let scale = w_src as f32 / w as f32;
-    let mut ch0 = vec![0.0f32; h * w]; // range / distance
-    let mut ch1 = vec![0.0f32; h * w]; // intensity
+    let scale_x = w_src as f32 / w as f32;
+    let scale_y = h_src as f32 / h as f32;
+    let mut range = vec![0.0f32; h * w];
+    let mut intensity = vec![0.0f32; h * w];
 
     for row in 0..h {
+        let src_y = (row as f32 + 0.5) * scale_y - 0.5;
+        let y0 = (src_y.floor() as isize).clamp(0, h_src as isize - 1) as usize;
+        let y1 = (y0 + 1).min(h_src - 1);
+        let ty = (src_y - y0 as f32).clamp(0.0, 1.0);
+
         for col in 0..w {
-            let src_x = (col as f32 + 0.5) * scale - 0.5;
+            let src_x = (col as f32 + 0.5) * scale_x - 0.5;
             let x0 = (src_x.floor() as isize).clamp(0, w_src as isize - 1) as usize;
             let x1 = (x0 + 1).min(w_src - 1);
-            let t = (src_x - x0 as f32).clamp(0.0, 1.0);
+            let tx = (src_x - x0 as f32).clamp(0.0, 1.0);
 
-            let i0 = (row * w_src + x0) * c_src;
-            let i1 = (row * w_src + x1) * c_src;
-            let r0 = values.get(i0).copied().unwrap_or(0.0);
-            let r1 = values.get(i1).copied().unwrap_or(0.0);
-            let intensity0 = values.get(i0 + 1).copied().unwrap_or(0.0);
-            let intensity1 = values.get(i1 + 1).copied().unwrap_or(0.0);
+            let i00 = (y0 * w_src + x0) * c_src;
+            let i01 = (y0 * w_src + x1) * c_src;
+            let i10 = (y1 * w_src + x0) * c_src;
+            let i11 = (y1 * w_src + x1) * c_src;
 
-            ch0[row * w + col] = r0 + t * (r1 - r0);
-            ch1[row * w + col] = intensity0 + t * (intensity1 - intensity0);
+            let r00 = values.get(i00).copied().unwrap_or(0.0);
+            let r01 = values.get(i01).copied().unwrap_or(0.0);
+            let r10 = values.get(i10).copied().unwrap_or(0.0);
+            let r11 = values.get(i11).copied().unwrap_or(0.0);
+
+            let t00 = values.get(i00 + 1).copied().unwrap_or(0.0);
+            let t01 = values.get(i01 + 1).copied().unwrap_or(0.0);
+            let t10 = values.get(i10 + 1).copied().unwrap_or(0.0);
+            let t11 = values.get(i11 + 1).copied().unwrap_or(0.0);
+
+            let r0 = r00 + tx * (r01 - r00);
+            let r1 = r10 + tx * (r11 - r10);
+            let v_range = r0 + ty * (r1 - r0);
+
+            let t0 = t00 + tx * (t01 - t00);
+            let t1 = t10 + tx * (t11 - t10);
+            let v_intensity = t0 + ty * (t1 - t0);
+
+            range[row * w + col] = v_range;
+            intensity[row * w + col] = v_intensity;
         }
     }
 
     // Normalise channel 0: divide by physical max range, clamp to [0, 1]
-    for v in &mut ch0 {
+    for v in &mut range {
         *v = (*v / MAX_RANGE_METERS).clamp(0.0, 1.0);
     }
 
     // Normalise channel 1 (intensity): to [0, 1] by observed max
-    let int_max = ch1.iter().cloned().fold(0.0f32, f32::max);
+    let int_max = intensity.iter().cloned().fold(0.0f32, f32::max);
     if int_max > 0.0 {
-        for v in &mut ch1 {
+        for v in &mut intensity {
             *v = (*v / int_max).clamp(0.0, 1.0);
         }
     }
 
-    // Pack as CHW: [2, H, W]
-    let mut chw = Vec::with_capacity(2 * h * w);
-    chw.extend_from_slice(&ch0);
-    chw.extend_from_slice(&ch1);
+    let validity: Vec<f32> = range
+        .iter()
+        .map(|value| if *value > 0.0 { 1.0 } else { 0.0 })
+        .collect();
+
+    let mut chw = Vec::with_capacity(channels.len() * h * w);
+    for channel in channels {
+        match channel {
+            RangeChannel::Range => chw.extend_from_slice(&range),
+            RangeChannel::Intensity => chw.extend_from_slice(&intensity),
+            RangeChannel::ValidityMask => chw.extend_from_slice(&validity),
+        }
+    }
+
     Ok(chw)
 }
 
@@ -372,6 +471,29 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(stats.unmatched_camera, 1);
         assert_eq!(stats.unmatched_lidar, 0);
+    }
+
+    #[test]
+    fn process_range_supports_selected_channels() {
+        let values = vec![
+            10.0, 1.0, 20.0, 2.0, // row 0
+            0.0, 0.0, 40.0, 4.0, // row 1
+        ];
+        let shape = [2, 2, 2];
+
+        let chw = process_range(
+            &values,
+            &shape,
+            2,
+            2,
+            &[RangeChannel::Range, RangeChannel::ValidityMask],
+        )
+        .unwrap();
+
+        assert_eq!(chw.len(), 8);
+        assert!(chw[0] > 0.0);
+        assert_eq!(chw[4], 1.0);
+        assert_eq!(chw[6], 0.0);
     }
 
     fn camera(segment: &str, timestamp_micros: i64) -> CameraFrame {

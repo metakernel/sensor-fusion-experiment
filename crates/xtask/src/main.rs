@@ -107,6 +107,12 @@ pub(crate) struct DatasetPrepareArgs {
     pub(crate) input: Option<PathBuf>,
     #[arg(long)]
     pub(crate) output: Option<PathBuf>,
+    #[arg(long, value_parser = parse_hw)]
+    pub(crate) rgb_size: Option<[usize; 2]>,
+    #[arg(long, value_parser = parse_hw)]
+    pub(crate) range_size: Option<[usize; 2]>,
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) range_channels: Option<Vec<String>>,
     #[arg(long)]
     pub(crate) max_frames: Option<usize>,
     #[arg(long, default_value_t = sfx_waymo::extract::CAMERA_FRONT)]
@@ -121,8 +127,8 @@ pub(crate) struct DatasetPrepareArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct DatasetInspectArgs {
-    #[arg(long, default_value = "waymo")]
-    pub(crate) dataset: String,
+    #[arg(long)]
+    pub(crate) dataset: Option<PathBuf>,
     #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
     pub(crate) config: PathBuf,
     /// Number of sample tensor files to load when computing statistics.
@@ -132,8 +138,8 @@ pub(crate) struct DatasetInspectArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct DatasetPreviewArgs {
-    #[arg(long, default_value = "waymo")]
-    pub(crate) dataset: String,
+    #[arg(long)]
+    pub(crate) dataset: Option<PathBuf>,
     #[arg(long, default_value = "configs/dataset.waymo.small.toml")]
     pub(crate) config: PathBuf,
     /// Split to source samples from.
@@ -200,6 +206,28 @@ fn parse_dataset_source_split(value: &str) -> std::result::Result<DatasetSourceS
             "unsupported split {other}; expected train, val, or test"
         )),
     }
+}
+
+fn parse_hw(value: &str) -> std::result::Result<[usize; 2], String> {
+    let raw = value.trim().to_ascii_lowercase().replace('x', " ");
+    let mut parts = raw.split_whitespace();
+    let h = parts
+        .next()
+        .ok_or_else(|| "size must be in HxW format (for example 128x256)".to_string())?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid height in `{value}`"))?;
+    let w = parts
+        .next()
+        .ok_or_else(|| "size must be in HxW format (for example 128x256)".to_string())?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid width in `{value}`"))?;
+    if parts.next().is_some() {
+        return Err("size must be in HxW format (for example 128x256)".to_string());
+    }
+    if h == 0 || w == 0 {
+        return Err("size values must be greater than zero".to_string());
+    }
+    Ok([h, w])
 }
 
 fn main() -> Result<()> {

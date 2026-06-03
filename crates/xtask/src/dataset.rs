@@ -235,6 +235,21 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
         .map(|p| sfx_config::resolve_from_root(&paths.root, p))
         .unwrap_or(dataset_config.raw_dir.clone());
 
+    let rgb_size = args.rgb_size.unwrap_or(dataset_config.rgb_size);
+    let range_size = args.range_size.unwrap_or(dataset_config.range_size);
+    let configured_channels = args
+        .range_channels
+        .as_deref()
+        .unwrap_or(dataset_config.range_channels.as_slice());
+    let range_channels = parse_range_channels(configured_channels)?;
+    let process_options = sfx_preprocess::ProcessOptions {
+        rgb_height: rgb_size[0],
+        rgb_width: rgb_size[1],
+        range_height: range_size[0],
+        range_width: range_size[1],
+        range_channels,
+    };
+
     let mut all_entries: Vec<sfx_core::manifest::ProcessedSampleEntry> = Vec::new();
     let mut extraction_entries = Vec::new();
     let mut train_ids = Vec::new();
@@ -348,7 +363,13 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 .map(|_| sfx_core::manifest::SampleId(format!("sample_{sample_counter:06}")));
 
             for pair in &pairs {
-                let entry = sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
+                let entry = sfx_preprocess::write_sample_with_options(
+                    &out_dir,
+                    pair,
+                    &split,
+                    sample_counter,
+                    &process_options,
+                )?;
                 let id = entry.meta.id.clone();
                 all_entries.push(entry);
                 match &split {
@@ -395,13 +416,13 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
         dataset: Some(dataset_config.name.clone()),
         rgb_shape: Some(sfx_core::manifest::TensorShape {
             channels: 3,
-            height: sfx_preprocess::RGB_H,
-            width: sfx_preprocess::RGB_W,
+            height: process_options.rgb_height,
+            width: process_options.rgb_width,
         }),
         range_shape: Some(sfx_core::manifest::TensorShape {
-            channels: sfx_preprocess::RANGE_CHANNELS,
-            height: sfx_preprocess::RANGE_H,
-            width: sfx_preprocess::RANGE_W,
+            channels: process_options.range_channels.len(),
+            height: process_options.range_height,
+            width: process_options.range_width,
         }),
         samples: all_entries,
     };
@@ -847,6 +868,155 @@ fn command_error(output: &Output) -> String {
     }
 }
 
+fn parse_range_channels(values: &[String]) -> Result<Vec<sfx_preprocess::RangeChannel>> {
+    let mut channels = Vec::new();
+    for value in values {
+        let key = value.trim().to_ascii_lowercase();
+        let channel = match key.as_str() {
+            "range" | "distance" => sfx_preprocess::RangeChannel::Range,
+            "intensity" => sfx_preprocess::RangeChannel::Intensity,
+            "valid" | "validity" | "mask" | "validity-mask" => {
+                sfx_preprocess::RangeChannel::ValidityMask
+            }
+            _ => {
+                anyhow::bail!(
+                    "unsupported range channel `{value}`; expected range, intensity, or validity"
+                )
+            }
+        };
+        channels.push(channel);
+    }
+    if channels.is_empty() {
+        anyhow::bail!("at least one range channel is required");
+    }
+    Ok(channels)
+}
+
+fn resolve_processed_dir(dataset_arg: Option<&Path>, dataset_config: &sfx_config::DatasetConfig) -> PathBuf {
+    dataset_arg
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dataset_config.processed_dir.clone())
+}
+
+#[derive(Default)]
+struct SuspiciousSampleReport {
+    missing_files: usize,
+    wrong_tensor_size: usize,
+    non_finite_values: usize,
+    rgb_out_of_range: usize,
+    range_out_of_range: usize,
+    low_valid_fraction: usize,
+}
+
+fn scan_suspicious_samples(
+    manifest: &ProcessedSampleManifest,
+    processed_dir: &Path,
+) -> Result<SuspiciousSampleReport> {
+    let mut report = SuspiciousSampleReport::default();
+    let rgb_shape = manifest
+        .rgb_shape
+        .as_ref()
+        .context("processed sample manifest is missing rgb_shape")?;
+    let range_shape = manifest
+        .range_shape
+        .as_ref()
+        .context("processed sample manifest is missing range_shape")?;
+
+    let rgb_expected = rgb_shape.value_count();
+    let range_expected = range_shape.value_count();
+    let range_pixels = range_shape.height * range_shape.width;
+
+    for sample in &manifest.samples {
+        let rgb_path = processed_dir.join(&sample.meta.rgb_path);
+        let range_path = processed_dir.join(&sample.meta.range_path);
+        if !rgb_path.exists() || !range_path.exists() {
+            report.missing_files += 1;
+            continue;
+        }
+
+        let rgb = bytes_to_f32_le(&std::fs::read(&rgb_path)?);
+        let range = bytes_to_f32_le(&std::fs::read(&range_path)?);
+        if rgb.len() != rgb_expected || range.len() != range_expected {
+            report.wrong_tensor_size += 1;
+            continue;
+        }
+
+        if rgb.iter().any(|v| !v.is_finite()) || range.iter().any(|v| !v.is_finite()) {
+            report.non_finite_values += 1;
+        }
+
+        if rgb.iter().any(|v| *v < 0.0 || *v > 1.0) {
+            report.rgb_out_of_range += 1;
+        }
+
+        if range.iter().any(|v| *v < 0.0 || *v > 1.0) {
+            report.range_out_of_range += 1;
+        }
+
+        let valid = range
+            .iter()
+            .take(range_pixels.min(range.len()))
+            .filter(|v| **v > 0.0)
+            .count();
+        let valid_frac = valid as f64 / range_pixels.max(1) as f64;
+        if valid_frac < 0.01 {
+            report.low_valid_fraction += 1;
+        }
+    }
+
+    Ok(report)
+}
+
+fn render_rgb_from_tensor(path: &Path, shape: &sfx_core::manifest::TensorShape) -> Result<image::RgbImage> {
+    let values = bytes_to_f32_le(&std::fs::read(path)?);
+    let expected = shape.value_count();
+    if values.len() != expected {
+        anyhow::bail!(
+            "{} has {} values; expected {}",
+            path.display(),
+            values.len(),
+            expected
+        );
+    }
+    if shape.channels < 3 {
+        anyhow::bail!("RGB tensor requires at least 3 channels");
+    }
+
+    let plane = shape.height * shape.width;
+    let mut pixels = vec![0u8; 3 * plane];
+    for i in 0..plane {
+        pixels[3 * i] = (values[i].clamp(0.0, 1.0) * 255.0) as u8;
+        pixels[3 * i + 1] = (values[plane + i].clamp(0.0, 1.0) * 255.0) as u8;
+        pixels[3 * i + 2] = (values[2 * plane + i].clamp(0.0, 1.0) * 255.0) as u8;
+    }
+
+    image::RgbImage::from_raw(shape.width as u32, shape.height as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("failed to construct RGB image"))
+}
+
+fn render_range_from_tensor(path: &Path, shape: &sfx_core::manifest::TensorShape) -> Result<image::GrayImage> {
+    let values = bytes_to_f32_le(&std::fs::read(path)?);
+    let expected = shape.value_count();
+    if values.len() != expected {
+        anyhow::bail!(
+            "{} has {} values; expected {}",
+            path.display(),
+            values.len(),
+            expected
+        );
+    }
+
+    let plane = shape.height * shape.width;
+    let pixels: Vec<u8> = values
+        .iter()
+        .take(plane)
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+
+    image::GrayImage::from_raw(shape.width as u32, shape.height as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("failed to construct range image"))
+}
+
 // ---------------------------------------------------------------------------
 // dataset inspect
 // ---------------------------------------------------------------------------
@@ -865,7 +1035,7 @@ fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
     let manifest: ProcessedSampleManifest = read_manifest(&manifest_path)?;
     manifest.validate()?;
 
-    let processed_dir = paths.root.join(&dataset_config.processed_dir);
+    let processed_dir = resolve_processed_dir(args.dataset.as_deref(), &dataset_config);
 
     println!("dataset:       {}", dataset_config.name);
     println!(
@@ -928,8 +1098,17 @@ fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
     let step = (manifest.samples.len() as f64 / n as f64).ceil() as usize;
     let sample_entries: Vec<_> = manifest.samples.iter().step_by(step).take(n).collect();
 
+    let rgb_shape = manifest
+        .rgb_shape
+        .as_ref()
+        .context("processed sample manifest is missing rgb_shape")?;
+    let range_shape = manifest
+        .range_shape
+        .as_ref()
+        .context("processed sample manifest is missing range_shape")?;
+
     let (rgb_stats, range_stats0, range_stats1, valid_frac) =
-        compute_tensor_stats(&sample_entries, &processed_dir)?;
+        compute_tensor_stats(&sample_entries, &processed_dir, rgb_shape, range_shape)?;
 
     println!();
     println!("rgb tensor statistics ({n} samples sampled):");
@@ -943,6 +1122,16 @@ fn inspect(args: DatasetInspectArgs, paths: &ProjectPaths) -> Result<()> {
     println!();
     println!("range channel 1 (intensity) statistics ({n} samples sampled):");
     print_stats(&range_stats1);
+
+    let suspicious = scan_suspicious_samples(&manifest, &processed_dir)?;
+    println!();
+    println!("suspicious samples:");
+    println!("  missing files:         {}", suspicious.missing_files);
+    println!("  wrong tensor length:   {}", suspicious.wrong_tensor_size);
+    println!("  non-finite values:     {}", suspicious.non_finite_values);
+    println!("  rgb out of [0,1]:      {}", suspicious.rgb_out_of_range);
+    println!("  range out of [0,1]:    {}", suspicious.range_out_of_range);
+    println!("  near-empty range mask: {}", suspicious.low_valid_fraction);
 
     Ok(())
 }
@@ -964,9 +1153,11 @@ fn print_stats(s: &TensorStats) {
 fn compute_tensor_stats(
     entries: &[&sfx_core::manifest::ProcessedSampleEntry],
     processed_dir: &Path,
+    rgb_shape: &sfx_core::manifest::TensorShape,
+    range_shape: &sfx_core::manifest::TensorShape,
 ) -> Result<(TensorStats, TensorStats, TensorStats, f64)> {
-    let _rgb_shape = sfx_preprocess::RGB_H * sfx_preprocess::RGB_W;
-    let range_pixels = sfx_preprocess::RANGE_H * sfx_preprocess::RANGE_W;
+    let rgb_values = rgb_shape.value_count();
+    let range_pixels = range_shape.height * range_shape.width;
 
     let mut rgb_acc = StatsAccum::new();
     let mut range0_acc = StatsAccum::new();
@@ -979,6 +1170,14 @@ fn compute_tensor_stats(
         let bytes =
             std::fs::read(&rgb_path).with_context(|| format!("reading {}", rgb_path.display()))?;
         let values = bytes_to_f32_le(&bytes);
+        if values.len() != rgb_values {
+            anyhow::bail!(
+                "{} has {} values; expected {}",
+                rgb_path.display(),
+                values.len(),
+                rgb_values
+            );
+        }
         for &v in &values {
             rgb_acc.push(v);
         }
@@ -996,7 +1195,7 @@ fn compute_tensor_stats(
             }
             total_range_pixels += 1;
         }
-        // Channel 1: next range_pixels values
+        // Channel 1: next range_pixels values (if present)
         for i in range_pixels..(2 * range_pixels).min(values.len()) {
             range1_acc.push(values[i]);
         }
@@ -1094,7 +1293,18 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
     }
     let manifest: ProcessedSampleManifest = read_manifest(&manifest_path)?;
 
-    let processed_dir = paths.root.join(&dataset_config.processed_dir);
+    let processed_dir = resolve_processed_dir(args.dataset.as_deref(), &dataset_config);
+
+    let rgb_shape = manifest
+        .rgb_shape
+        .as_ref()
+        .context("processed sample manifest is missing rgb_shape")?
+        .clone();
+    let range_shape = manifest
+        .range_shape
+        .as_ref()
+        .context("processed sample manifest is missing range_shape")?
+        .clone();
 
     // Filter by requested split string ("train", "val", "test", or "all")
     let target_split = args.split.trim().to_ascii_lowercase();
@@ -1126,10 +1336,10 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
     let rgb_grid_path = out_dir.join("rgb_grid.png");
     let range_grid_path = out_dir.join("range_grid.png");
 
-    let rgb_tile_w = sfx_preprocess::RGB_W as u32;
-    let rgb_tile_h = sfx_preprocess::RGB_H as u32;
-    let range_tile_w = sfx_preprocess::RANGE_W as u32;
-    let range_tile_h = sfx_preprocess::RANGE_H as u32;
+    let rgb_tile_w = rgb_shape.width as u32;
+    let rgb_tile_h = rgb_shape.height as u32;
+    let range_tile_w = range_shape.width as u32;
+    let range_tile_h = range_shape.height as u32;
 
     let mut rgb_canvas = image::RgbImage::new(cols as u32 * rgb_tile_w, rows as u32 * rgb_tile_h);
     let mut range_canvas =
@@ -1141,6 +1351,7 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
         let row = (idx / cols) as u32;
 
         // RGB tile
+        let mut rgb_loaded = false;
         if let Some(preview_path) = &entry.preview_rgb_path {
             let src = processed_dir.join(preview_path);
             if src.exists() {
@@ -1160,13 +1371,30 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
                             (row * rgb_tile_h) as i64,
                         );
                         loaded += 1;
+                        rgb_loaded = true;
                     }
                     Err(e) => eprintln!("warn: could not load {}: {e}", src.display()),
                 }
             }
         }
+        if !rgb_loaded {
+            let src = processed_dir.join(&entry.meta.rgb_path);
+            match render_rgb_from_tensor(&src, &rgb_shape) {
+                Ok(tile) => {
+                    image::imageops::replace(
+                        &mut rgb_canvas,
+                        &tile,
+                        (col * rgb_tile_w) as i64,
+                        (row * rgb_tile_h) as i64,
+                    );
+                    loaded += 1;
+                }
+                Err(e) => eprintln!("warn: could not render RGB tensor {}: {e}", src.display()),
+            }
+        }
 
         // Range tile
+        let mut range_loaded = false;
         if let Some(preview_path) = &entry.preview_range_path {
             let src = processed_dir.join(preview_path);
             if src.exists() {
@@ -1185,8 +1413,25 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
                             (col * range_tile_w) as i64,
                             (row * range_tile_h) as i64,
                         );
+                        range_loaded = true;
                     }
                     Err(e) => eprintln!("warn: could not load {}: {e}", src.display()),
+                }
+            }
+        }
+        if !range_loaded {
+            let src = processed_dir.join(&entry.meta.range_path);
+            match render_range_from_tensor(&src, &range_shape) {
+                Ok(tile) => {
+                    image::imageops::replace(
+                        &mut range_canvas,
+                        &tile,
+                        (col * range_tile_w) as i64,
+                        (row * range_tile_h) as i64,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("warn: could not render range tensor {}: {e}", src.display())
                 }
             }
         }
@@ -1320,6 +1565,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_range_channels_accepts_aliases() {
+        let channels = parse_range_channels(&[
+            "distance".to_string(),
+            "intensity".to_string(),
+            "valid".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(channels.len(), 3);
+        assert!(matches!(
+            channels[0],
+            sfx_preprocess::RangeChannel::Range
+        ));
+        assert!(matches!(
+            channels[2],
+            sfx_preprocess::RangeChannel::ValidityMask
+        ));
+    }
+
+    #[test]
+    fn render_rgb_from_tensor_uses_chw_layout() {
+        let root = temp_root("render_rgb_from_tensor_uses_chw_layout");
+        let path = root.join("rgb.f32.bin");
+        let values = vec![
+            1.0, 0.0, // R
+            0.0, 1.0, // G
+            0.0, 0.0, // B
+        ];
+        write_f32_file(&path, &values);
+
+        let img = render_rgb_from_tensor(
+            &path,
+            &sfx_core::manifest::TensorShape {
+                channels: 3,
+                height: 1,
+                width: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
     fn fetch_args(splits: Vec<DatasetSourceSplit>) -> DatasetFetchArgs {
         DatasetFetchArgs {
             dataset: "waymo".to_string(),
@@ -1356,5 +1646,10 @@ mod tests {
 
     fn file_uri(path: &Path) -> String {
         format!("file://{}", path.display().to_string().replace('\\', "/"))
+    }
+
+    fn write_f32_file(path: &Path, values: &[f32]) {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(path, bytes).unwrap();
     }
 }

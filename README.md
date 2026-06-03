@@ -23,6 +23,9 @@ cargo xtask gcloud auth
 cargo xtask gcloud check
 cargo xtask dataset list --split training --limit 20
 cargo xtask dataset fetch --splits train,val --train-files 1 --val-files 1
+cargo xtask dataset prepare --max-frames 128 --rgb-size 128x256 --range-size 64x256 --range-channels range,intensity
+cargo xtask dataset inspect --sample-count 32
+cargo xtask dataset preview --split train --count 16 --out artifacts/previews/dataset
 ```
 
 ## Command overview
@@ -35,7 +38,9 @@ cargo xtask dataset fetch --splits train,val --train-files 1 --val-files 1
 - `cargo xtask gcloud logout`: revoke application-default credentials and remove local credential files.
 - `cargo xtask dataset list`: list Waymo Cloud Storage objects for one source split and write `.xtask/manifests/raw_files.json`.
 - `cargo xtask dataset fetch`: download selected Waymo objects into split-specific raw data folders and write `.xtask/manifests/downloaded_files.json`.
-- `cargo xtask dataset prepare`: extract and align camera/lidar frames from matched parquet files, then write processed samples, extraction summaries, and manifests.
+- `cargo xtask dataset prepare`: extract and align camera/lidar frames from matched parquet files, resize and normalize tensors, then write processed samples plus manifests.
+- `cargo xtask dataset inspect`: report split counts, tensor stats, and suspicious sample checks from the processed dataset.
+- `cargo xtask dataset preview`: export RGB and range grid previews from processed samples.
 
 ## License
 
