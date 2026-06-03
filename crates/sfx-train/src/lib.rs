@@ -60,6 +60,8 @@ pub struct TrainingSummary {
     pub max_batches_per_epoch: Option<usize>,
     pub latent_dim: usize,
     pub final_train_loss: f64,
+    #[serde(default)]
+    pub final_val_loss: Option<f64>,
     pub backend: String,
     #[serde(default)]
     pub optimizer: String,
@@ -126,6 +128,15 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         bail!("training split is empty; run `cargo xtask dataset prepare --splits train` first");
     }
     train_dataset.validate_tensor_files()?;
+    let val_dataset = FusionDataset::open_split(
+        &config.dataset.processed_dir,
+        &manifest_path,
+        Some(Split::Val),
+    )
+    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    if !val_dataset.is_empty() {
+        val_dataset.validate_tensor_files()?;
+    }
 
     let run = prepare_run(
         root,
@@ -144,6 +155,20 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
     let metrics_path = run.metrics_path.clone();
     let mut metric_lines = String::new();
     let mut final_train_loss = f64::INFINITY;
+    let mut final_val_loss = None;
+    let total_batches_per_epoch = train_dataset.len().div_ceil(config.batch_size);
+    let batches_per_epoch = config
+        .max_batches_per_epoch
+        .unwrap_or(total_batches_per_epoch)
+        .min(total_batches_per_epoch);
+    println!(
+        "range training: samples={} val_samples={} batch_size={} batches/epoch={} epochs={}",
+        train_dataset.len(),
+        val_dataset.len(),
+        config.batch_size,
+        batches_per_epoch,
+        config.epochs
+    );
 
     for epoch in 1..=config.epochs {
         let options = BatchOptions::new(config.batch_size).shuffled(config.seed + epoch as u64);
@@ -154,6 +179,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         for batch in train_dataset.batches(options)? {
             let batch = batch?.into_burn::<TrainBackend>(&device);
             let current_batch_size = batch.batch_size();
+            batch_count += 1;
             let target = batch.range.clone();
             let output = model.forward(batch.range);
             let loss = mse_loss(output.range_hat, target);
@@ -164,14 +190,18 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
 
             total_loss += loss_value * current_batch_size as f64;
             total_samples += current_batch_size;
-            batch_count += 1;
+            if batch_count >= batches_per_epoch {
+                break;
+            }
         }
 
         final_train_loss = total_loss / total_samples.max(1) as f64;
+        let val_loss = evaluate_range_autoencoder(&model.valid(), &val_dataset, config.batch_size)?;
+        final_val_loss = val_loss;
         let metric = EpochMetric {
             epoch,
             train_loss: final_train_loss,
-            val_loss: None,
+            val_loss,
             sample_count: total_samples,
             batch_count,
         };
@@ -225,6 +255,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
+        final_val_loss,
         backend: "burn-flex-autodiff".to_string(),
         optimizer: "adam".to_string(),
     };
@@ -236,6 +267,33 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
     mark_run_completed(root, &run, &completed_at)?;
 
     Ok(summary)
+}
+
+fn evaluate_range_autoencoder(
+    model: &RangeAutoencoder<InnerBackend>,
+    dataset: &FusionDataset,
+    batch_size: usize,
+) -> Result<Option<f64>> {
+    if dataset.is_empty() {
+        return Ok(None);
+    }
+
+    let device = Device::<InnerBackend>::default();
+    let mut total_loss = 0.0f64;
+    let mut total_samples = 0usize;
+
+    for batch in dataset.batches(BatchOptions::new(batch_size))? {
+        let batch = batch?.into_burn::<InnerBackend>(&device);
+        let current_batch_size = batch.batch_size();
+        let target = batch.range.clone();
+        let output = model.forward(batch.range);
+        let loss = mse_loss(output.range_hat, target);
+        let loss_value = loss.into_scalar().to_f64();
+        total_loss += loss_value * current_batch_size as f64;
+        total_samples += current_batch_size;
+    }
+
+    Ok(Some(total_loss / total_samples.max(1) as f64))
 }
 
 pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<TrainingSummary> {
@@ -358,6 +416,7 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
+        final_val_loss: None,
         backend: "burn-flex-autodiff".to_string(),
         optimizer: "adam".to_string(),
     };
@@ -519,6 +578,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         final_train_loss,
+        final_val_loss: None,
         backend: "burn-flex-autodiff".to_string(),
         optimizer: "adam".to_string(),
     };

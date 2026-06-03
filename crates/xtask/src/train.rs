@@ -26,6 +26,9 @@ pub(crate) fn run(args: TrainArgs, paths: &ProjectPaths) -> Result<()> {
     println!("     batch size: {}", summary.batch_size);
     println!("     latent dim: {}", summary.latent_dim);
     println!("     final loss: {:.6}", summary.final_train_loss);
+    if let Some(val_loss) = summary.final_val_loss {
+        println!("     val loss:   {:.6}", val_loss);
+    }
     println!(
         "ok   {}",
         display_from_root(&paths.root, &summary.metrics_path)

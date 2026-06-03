@@ -536,6 +536,47 @@ mod tests {
         assert!(err.to_string().contains("expected 48"));
     }
 
+    #[test]
+    fn loads_sample_by_id() {
+        let root = temp_root("loads_sample_by_id");
+        let processed = root.join("processed");
+        let manifest_path = root.join("processed_samples.json");
+        let manifest = fixture_manifest(&processed, 3).unwrap();
+        write_manifest(&manifest_path, &manifest).unwrap();
+        let dataset = FusionDataset::open(&processed, &manifest_path).unwrap();
+
+        let sample = dataset
+            .load_sample_by_id(&SampleId("sample_000001".to_string()))
+            .unwrap();
+
+        assert_eq!(sample.id().0, "sample_000001");
+        assert_eq!(sample.meta().timestamp_micros, 1);
+    }
+
+    #[test]
+    fn batches_drop_last_when_requested() {
+        let root = temp_root("batches_drop_last_when_requested");
+        let processed = root.join("processed");
+        let manifest_path = root.join("processed_samples.json");
+        let manifest = fixture_manifest(&processed, 5).unwrap();
+        write_manifest(&manifest_path, &manifest).unwrap();
+        let dataset = FusionDataset::open(&processed, &manifest_path).unwrap();
+
+        let count_keep_partial = dataset
+            .batches(BatchOptions::new(2))
+            .unwrap()
+            .map(|b| b.unwrap().batch_size())
+            .collect::<Vec<_>>();
+        let count_drop_partial = dataset
+            .batches(BatchOptions::new(2).drop_last(true))
+            .unwrap()
+            .map(|b| b.unwrap().batch_size())
+            .collect::<Vec<_>>();
+
+        assert_eq!(count_keep_partial, vec![2, 2, 1]);
+        assert_eq!(count_drop_partial, vec![2, 2]);
+    }
+
     fn collect_batch_ids(iter: BatchIter<'_>) -> Vec<String> {
         iter.flat_map(|batch| batch.unwrap().sample_ids)
             .map(|id| id.0)
