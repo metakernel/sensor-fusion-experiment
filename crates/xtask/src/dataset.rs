@@ -9,7 +9,7 @@ use sfx_core::manifest::{
     read_manifest, write_manifest,
 };
 use sfx_waymo::{DiscoveryConfig, parse_gcloud_storage_listing, split_label};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
 
@@ -262,6 +262,24 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
 
         let camera_files = parquet_files_in(&camera_dir)?;
         let lidar_files = parquet_files_in(&lidar_dir)?;
+        let paired_files = pair_component_parquet_files(&camera_files, &lidar_files);
+
+        if paired_files.len() < camera_files.len() {
+            println!(
+                "warn {} camera parquet file(s) have no matching lidar file",
+                camera_files.len() - paired_files.len()
+            );
+        }
+        if paired_files.len() < lidar_files.len() {
+            println!(
+                "warn {} lidar parquet file(s) have no matching camera file",
+                lidar_files.len() - paired_files.len()
+            );
+        }
+        if paired_files.is_empty() {
+            println!("warn no matching camera/lidar parquet files for {split_dir_name}; skipping");
+            continue;
+        }
 
         if args.inspect {
             println!("\n--- camera_image schema ({split_dir_name}) ---");
@@ -279,15 +297,23 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
             continue;
         }
 
-        for (cam_path, lid_path) in camera_files.iter().zip(lidar_files.iter()) {
+        for (cam_path, lid_path) in paired_files {
             println!(
                 "extracting {} + {}",
                 cam_path.file_name().unwrap_or_default().to_string_lossy(),
                 lid_path.file_name().unwrap_or_default().to_string_lossy()
             );
 
-            let camera_frames = sfx_waymo::extract::read_camera_frames(cam_path, args.max_frames)?;
-            let lidar_frames = sfx_waymo::extract::read_lidar_frames(lid_path, args.max_frames)?;
+            let camera_frames = sfx_waymo::extract::read_camera_frames_for_sensor(
+                &cam_path,
+                args.camera_name,
+                args.max_frames,
+            )?;
+            let lidar_frames = sfx_waymo::extract::read_lidar_frames_for_sensor(
+                &lid_path,
+                args.laser_name,
+                args.max_frames,
+            )?;
 
             println!(
                 "  camera frames: {}, lidar frames: {}",
@@ -295,8 +321,26 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 lidar_frames.len()
             );
 
-            let pairs = sfx_preprocess::align_frames(camera_frames, lidar_frames);
-            println!("  aligned pairs: {}", pairs.len());
+            let (pairs, align_stats) = sfx_preprocess::align_frames_with_options(
+                camera_frames,
+                lidar_frames,
+                sfx_preprocess::AlignOptions {
+                    max_timestamp_delta_micros: args.max_timestamp_delta_us.max(0),
+                },
+            );
+            println!("  aligned pairs: {}", align_stats.matched_pairs);
+            if align_stats.unmatched_camera > 0 || align_stats.unmatched_lidar > 0 {
+                println!(
+                    "  unmatched camera: {}, unmatched lidar: {}",
+                    align_stats.unmatched_camera, align_stats.unmatched_lidar
+                );
+            }
+            if align_stats.max_abs_timestamp_delta_micros > 0 {
+                println!(
+                    "  max |camera_ts - lidar_ts|: {} µs",
+                    align_stats.max_abs_timestamp_delta_micros
+                );
+            }
 
             for pair in &pairs {
                 let entry = sfx_preprocess::write_sample(&out_dir, pair, &split, sample_counter)?;
@@ -369,6 +413,30 @@ fn parquet_files_in(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
         .collect();
     files.sort();
     Ok(files)
+}
+
+fn pair_component_parquet_files(
+    camera_files: &[PathBuf],
+    lidar_files: &[PathBuf],
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut lidar_by_name = BTreeMap::new();
+    for path in lidar_files {
+        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+            lidar_by_name.insert(name.to_string(), path.clone());
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for camera_path in camera_files {
+        let Some(name) = camera_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(lidar_path) = lidar_by_name.remove(name) {
+            pairs.push((camera_path.clone(), lidar_path));
+        }
+    }
+
+    pairs
 }
 
 fn discovery_config(args: &DatasetListArgs, waymo: sfx_config::WaymoConfig) -> DiscoveryConfig {
@@ -1178,6 +1246,24 @@ mod tests {
 
         assert!(err.to_string().contains("size mismatch"));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn pair_component_parquet_files_matches_on_file_name() {
+        let camera_files = vec![
+            PathBuf::from("raw/training/camera_image/a.parquet"),
+            PathBuf::from("raw/training/camera_image/b.parquet"),
+        ];
+        let lidar_files = vec![
+            PathBuf::from("raw/training/lidar/b.parquet"),
+            PathBuf::from("raw/training/lidar/c.parquet"),
+        ];
+
+        let pairs = pair_component_parquet_files(&camera_files, &lidar_files);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, PathBuf::from("raw/training/camera_image/b.parquet"));
+        assert_eq!(pairs[0].1, PathBuf::from("raw/training/lidar/b.parquet"));
     }
 
     fn fetch_args(splits: Vec<DatasetSourceSplit>) -> DatasetFetchArgs {

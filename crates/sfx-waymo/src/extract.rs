@@ -53,6 +53,14 @@ pub fn read_schema(path: &Path) -> Result<Vec<SchemaField>> {
 }
 
 pub fn read_camera_frames(path: &Path, max: Option<usize>) -> Result<Vec<CameraFrame>> {
+    read_camera_frames_for_sensor(path, CAMERA_FRONT, max)
+}
+
+pub fn read_camera_frames_for_sensor(
+    path: &Path,
+    sensor_name: i8,
+    max: Option<usize>,
+) -> Result<Vec<CameraFrame>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading parquet metadata of {}", path.display()))?;
@@ -73,14 +81,16 @@ pub fn read_camera_frames(path: &Path, max: Option<usize>) -> Result<Vec<CameraF
 
         let segments = col_as::<StringArray>(&batch, COL_SEGMENT, "StringArray")?;
         let timestamps = col_as::<Int64Array>(&batch, COL_TIMESTAMP, "Int64Array")?;
-        let camera_names = col_as::<Int8Array>(&batch, COL_CAMERA_NAME, "Int8Array")?;
+        let camera_names = batch
+            .column_by_name(COL_CAMERA_NAME)
+            .ok_or_else(|| anyhow!("missing column '{COL_CAMERA_NAME}'"))?;
 
         let img_arr = batch
             .column_by_name(&image_col)
             .ok_or_else(|| anyhow!("column {image_col} missing in batch"))?;
 
         for i in 0..batch.num_rows() {
-            if camera_names.value(i) != CAMERA_FRONT {
+            if sensor_name_at(camera_names.as_ref(), i)? != sensor_name {
                 continue;
             }
             let jpeg_bytes = extract_binary(img_arr, i)
@@ -102,6 +112,14 @@ pub fn read_camera_frames(path: &Path, max: Option<usize>) -> Result<Vec<CameraF
 }
 
 pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFrame>> {
+    read_lidar_frames_for_sensor(path, LASER_TOP, max)
+}
+
+pub fn read_lidar_frames_for_sensor(
+    path: &Path,
+    sensor_name: i8,
+    max: Option<usize>,
+) -> Result<Vec<LidarFrame>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading parquet metadata of {}", path.display()))?;
@@ -130,7 +148,9 @@ pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFra
 
         let segments = col_as::<StringArray>(&batch, COL_SEGMENT, "StringArray")?;
         let timestamps = col_as::<Int64Array>(&batch, COL_TIMESTAMP, "Int64Array")?;
-        let laser_names = col_as::<Int8Array>(&batch, COL_LASER_NAME, "Int8Array")?;
+        let laser_names = batch
+            .column_by_name(COL_LASER_NAME)
+            .ok_or_else(|| anyhow!("missing column '{COL_LASER_NAME}'"))?;
 
         let values_arr = batch
             .column_by_name(&values_col)
@@ -140,7 +160,7 @@ pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFra
             .ok_or_else(|| anyhow!("column {shape_col} missing in batch"))?;
 
         for i in 0..batch.num_rows() {
-            if laser_names.value(i) != LASER_TOP {
+            if sensor_name_at(laser_names.as_ref(), i)? != sensor_name {
                 continue;
             }
 
@@ -163,6 +183,22 @@ pub fn read_lidar_frames(path: &Path, max: Option<usize>) -> Result<Vec<LidarFra
     }
 
     Ok(frames)
+}
+
+fn sensor_name_at(col: &dyn Array, row: usize) -> Result<i8> {
+    if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+        return Ok(arr.value(row));
+    }
+
+    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+        return i8::try_from(arr.value(row))
+            .map_err(|_| anyhow!("sensor id {} out of i8 range", arr.value(row)));
+    }
+
+    Err(anyhow!(
+        "expected Int8 or Int32 sensor column, got {:?}",
+        col.data_type()
+    ))
 }
 
 fn find_binary_column(schema: &SchemaRef, name_fragment: &str) -> Option<String> {
@@ -215,43 +251,80 @@ fn extract_binary(col: &dyn Array, row: usize) -> Result<Vec<u8>> {
 
 /// Extract a row from a List<Float32> column.
 fn extract_float_list(col: &dyn Array, row: usize) -> Result<Vec<f32>> {
-    let list = col
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| anyhow!("expected ListArray, got {:?}", col.data_type()))?;
-    if list.is_null(row) {
-        return Ok(Vec::new());
+    if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
+        if list.is_null(row) {
+            return Ok(Vec::new());
+        }
+        let values = list.value(row);
+        let floats = values
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .ok_or_else(|| anyhow!("List element type is not Float32"))?;
+        return Ok((0..floats.len()).map(|i| floats.value(i)).collect());
     }
-    let values = list.value(row);
-    let floats = values
-        .as_any()
-        .downcast_ref::<arrow::array::Float32Array>()
-        .ok_or_else(|| anyhow!("List element type is not Float32"))?;
-    Ok((0..floats.len()).map(|i| floats.value(i)).collect())
+
+    if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        if list.is_null(row) {
+            return Ok(Vec::new());
+        }
+        let values = list.value(row);
+        let floats = values
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .ok_or_else(|| anyhow!("FixedSizeList element type is not Float32"))?;
+        return Ok((0..floats.len()).map(|i| floats.value(i)).collect());
+    }
+
+    Err(anyhow!(
+        "expected ListArray or FixedSizeListArray, got {:?}",
+        col.data_type()
+    ))
 }
 
 /// Extract a row from a FixedSizeList<Int32, N> column.
 fn extract_int32_fixed_list<const N: usize>(col: &dyn Array, row: usize) -> Result<[i32; N]> {
-    let list = col
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| anyhow!("expected FixedSizeListArray, got {:?}", col.data_type()))?;
-    if list.is_null(row) {
-        return Ok([0i32; N]);
+    if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        if list.is_null(row) {
+            return Ok([0i32; N]);
+        }
+        let values = list.value(row);
+        let ints = values
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| anyhow!("FixedSizeList element type is not Int32"))?;
+        if ints.len() < N {
+            anyhow::bail!("FixedSizeList has {} elements, expected {}", ints.len(), N);
+        }
+        let mut out = [0i32; N];
+        for (i, v) in out.iter_mut().enumerate() {
+            *v = ints.value(i);
+        }
+        return Ok(out);
     }
-    let values = list.value(row);
-    let ints = values
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| anyhow!("FixedSizeList element type is not Int32"))?;
-    if ints.len() < N {
-        anyhow::bail!("FixedSizeList has {} elements, expected {}", ints.len(), N);
+
+    if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
+        if list.is_null(row) {
+            return Ok([0i32; N]);
+        }
+        let values = list.value(row);
+        let ints = values
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| anyhow!("List element type is not Int32"))?;
+        if ints.len() < N {
+            anyhow::bail!("List has {} elements, expected {}", ints.len(), N);
+        }
+        let mut out = [0i32; N];
+        for (i, v) in out.iter_mut().enumerate() {
+            *v = ints.value(i);
+        }
+        return Ok(out);
     }
-    let mut out = [0i32; N];
-    for (i, v) in out.iter_mut().enumerate() {
-        *v = ints.value(i);
-    }
-    Ok(out)
+
+    Err(anyhow!(
+        "expected FixedSizeListArray or ListArray, got {:?}",
+        col.data_type()
+    ))
 }
 
 fn schema_summary(schema: &SchemaRef) -> String {

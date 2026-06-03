@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use sfx_core::manifest::{MultimodalSampleMeta, ProcessedSampleEntry, SampleId, Split};
 use sfx_waymo::extract::{CameraFrame, LidarFrame};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub const RGB_H: usize = 128;
@@ -20,14 +21,64 @@ pub struct ExtractedPair {
     pub range_shape: [usize; 3],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AlignOptions {
+    pub max_timestamp_delta_micros: i64,
+}
+
+impl Default for AlignOptions {
+    fn default() -> Self {
+        Self {
+            max_timestamp_delta_micros: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlignStats {
+    pub camera_frames: usize,
+    pub lidar_frames: usize,
+    pub matched_pairs: usize,
+    pub unmatched_camera: usize,
+    pub unmatched_lidar: usize,
+    pub max_abs_timestamp_delta_micros: i64,
+}
+
 pub fn align_frames(camera: Vec<CameraFrame>, lidar: Vec<LidarFrame>) -> Vec<ExtractedPair> {
+    align_frames_with_options(camera, lidar, AlignOptions::default()).0
+}
+
+pub fn align_frames_with_options(
+    camera: Vec<CameraFrame>,
+    lidar: Vec<LidarFrame>,
+    options: AlignOptions,
+) -> (Vec<ExtractedPair>, AlignStats) {
+    let max_delta = options.max_timestamp_delta_micros.max(0);
+    let mut stats = AlignStats {
+        camera_frames: camera.len(),
+        lidar_frames: lidar.len(),
+        ..AlignStats::default()
+    };
+
+    let mut lidar_timeline = HashMap::<String, BTreeMap<i64, Vec<LidarFrame>>>::new();
+    for frame in lidar {
+        lidar_timeline
+            .entry(frame.segment.clone())
+            .or_default()
+            .entry(frame.timestamp_micros)
+            .or_default()
+            .push(frame);
+    }
+
     let mut pairs = Vec::new();
 
-    for cam in &camera {
-        if let Some(lid) = lidar
-            .iter()
-            .find(|l| l.segment == cam.segment && l.timestamp_micros == cam.timestamp_micros)
-        {
+    for cam in camera {
+        let Some(segment_timeline) = lidar_timeline.get_mut(&cam.segment) else {
+            stats.unmatched_camera += 1;
+            continue;
+        };
+
+        if let Some((lid, abs_delta)) = pop_best_lidar(segment_timeline, cam.timestamp_micros, max_delta) {
             pairs.push(ExtractedPair {
                 segment: cam.segment.clone(),
                 timestamp_micros: cam.timestamp_micros,
@@ -35,10 +86,68 @@ pub fn align_frames(camera: Vec<CameraFrame>, lidar: Vec<LidarFrame>) -> Vec<Ext
                 range_values: lid.range_values.clone(),
                 range_shape: lid.shape,
             });
+            stats.max_abs_timestamp_delta_micros =
+                stats.max_abs_timestamp_delta_micros.max(abs_delta);
+        } else {
+            stats.unmatched_camera += 1;
         }
     }
 
-    pairs
+    stats.matched_pairs = pairs.len();
+    stats.unmatched_lidar = remaining_lidar_frames(&lidar_timeline);
+
+    (pairs, stats)
+}
+
+fn pop_best_lidar(
+    timeline: &mut BTreeMap<i64, Vec<LidarFrame>>,
+    target_ts: i64,
+    max_delta: i64,
+) -> Option<(LidarFrame, i64)> {
+    let lower = timeline
+        .range(..=target_ts)
+        .next_back()
+        .map(|(&ts, _)| ts);
+    let upper = timeline.range(target_ts..).next().map(|(&ts, _)| ts);
+
+    let choose = match (lower, upper) {
+        (Some(a), Some(b)) => {
+            let da = (target_ts - a).abs();
+            let db = (target_ts - b).abs();
+            if da <= db {
+                (a, da)
+            } else {
+                (b, db)
+            }
+        }
+        (Some(a), None) => (a, (target_ts - a).abs()),
+        (None, Some(b)) => (b, (target_ts - b).abs()),
+        (None, None) => return None,
+    };
+
+    if choose.1 > max_delta {
+        return None;
+    }
+
+    let (frame, remove_key) = {
+        let frames = timeline.get_mut(&choose.0)?;
+        let frame = frames.pop()?;
+        (frame, frames.is_empty())
+    };
+
+    if remove_key {
+        timeline.remove(&choose.0);
+    }
+
+    Some((frame, choose.1))
+}
+
+fn remaining_lidar_frames(timeline: &HashMap<String, BTreeMap<i64, Vec<LidarFrame>>>) -> usize {
+    timeline
+        .values()
+        .flat_map(|by_ts| by_ts.values())
+        .map(Vec::len)
+        .sum()
 }
 
 pub fn write_sample(
@@ -214,4 +323,71 @@ fn split_dir(split: &Split) -> &'static str {
 
 fn relative_path(base: &Path, full: &Path) -> PathBuf {
     full.strip_prefix(base).unwrap_or(full).to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn align_frames_matches_exact_timestamps() {
+        let camera = vec![camera("seg", 100), camera("seg", 200)];
+        let lidar = vec![lidar("seg", 100), lidar("seg", 300)];
+
+        let (pairs, stats) = align_frames_with_options(camera, lidar, AlignOptions::default());
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].timestamp_micros, 100);
+        assert_eq!(stats.camera_frames, 2);
+        assert_eq!(stats.lidar_frames, 2);
+        assert_eq!(stats.matched_pairs, 1);
+        assert_eq!(stats.unmatched_camera, 1);
+        assert_eq!(stats.unmatched_lidar, 1);
+    }
+
+    #[test]
+    fn align_frames_supports_small_timestamp_tolerance() {
+        let camera = vec![camera("seg", 1_000_000)];
+        let lidar = vec![lidar("seg", 1_000_012)];
+
+        let (pairs, stats) = align_frames_with_options(
+            camera,
+            lidar,
+            AlignOptions {
+                max_timestamp_delta_micros: 20,
+            },
+        );
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(stats.max_abs_timestamp_delta_micros, 12);
+    }
+
+    #[test]
+    fn align_frames_does_not_reuse_same_lidar_frame() {
+        let camera = vec![camera("seg", 100), camera("seg", 100)];
+        let lidar = vec![lidar("seg", 100)];
+
+        let (pairs, stats) = align_frames_with_options(camera, lidar, AlignOptions::default());
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(stats.unmatched_camera, 1);
+        assert_eq!(stats.unmatched_lidar, 0);
+    }
+
+    fn camera(segment: &str, timestamp_micros: i64) -> CameraFrame {
+        CameraFrame {
+            segment: segment.to_string(),
+            timestamp_micros,
+            jpeg_bytes: Vec::new(),
+        }
+    }
+
+    fn lidar(segment: &str, timestamp_micros: i64) -> LidarFrame {
+        LidarFrame {
+            segment: segment.to_string(),
+            timestamp_micros,
+            range_values: vec![0.0, 0.0],
+            shape: [1, 1, 2],
+        }
+    }
 }

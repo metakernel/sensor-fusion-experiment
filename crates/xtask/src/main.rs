@@ -109,6 +109,12 @@ pub(crate) struct DatasetPrepareArgs {
     pub(crate) output: Option<PathBuf>,
     #[arg(long)]
     pub(crate) max_frames: Option<usize>,
+    #[arg(long, default_value_t = sfx_waymo::extract::CAMERA_FRONT)]
+    pub(crate) camera_name: i8,
+    #[arg(long, default_value_t = sfx_waymo::extract::LASER_TOP)]
+    pub(crate) laser_name: i8,
+    #[arg(long, default_value_t = 0)]
+    pub(crate) max_timestamp_delta_us: i64,
     #[arg(long)]
     pub(crate) inspect: bool,
 }
