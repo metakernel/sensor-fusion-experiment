@@ -1,0 +1,126 @@
+[dataset]
+name = "waymo-mini"
+root = "data/raw/waymo-mini"
+train_split = "train"
+val_split = "val"
+test_split = "test"
+split_seed = 42
+
+[dataset.split_ratios]
+train = 0.7
+val = 0.2
+test = 0.1
+
+[dataset.modalities]
+range_image = true
+rgb = true
+point_cloud = true
+
+[dataset.sampling]
+max_scenes = 8
+max_frames_per_scene = 64
+shuffle = true
+
+[dataset.preprocessing]
+resize_width = 640
+resize_height = 384
+normalize_rgb = true
+range_clip_min_m = 0.0
+range_clip_max_m = 75.0
+
+[waymo]
+enabled = true
+records_dir = "data/raw/waymo"
+cache_dir = "data/cache/waymo"
+scene_index_path = ".xtask/manifests/waymo-scenes.json"
+max_frames_per_scene = 50
+
+[model]
+name = "fusion-net"
+type = "late-fusion"
+
+[model.input]
+use_range_image = true
+use_rgb = true
+range_channels = 5
+image_channels = 3
+
+[model.backbone]
+channels = [64, 128]
+blocks = [2, 2]
+dropout = 0.1
+
+[model.fusion]
+method = "concat"
+projection_dim = 64
+
+[model.head]
+num_classes = 10
+hidden_dim = 128
+loss = "cross_entropy"
+
+[training.run]
+name = "baseline"
+seed = 7
+device = "cpu"
+backend = "cpu"
+precision = "fp32"
+
+[training.trainer]
+max_epochs = 2
+batch_size = 4
+num_workers = 0
+gradient_accumulation_steps = 1
+gradient_clip_norm = 1.0
+log_every_n_steps = 1
+limit_train_batches = 1.0
+limit_val_batches = 1.0
+checkpoint_every_n_epochs = 1
+
+[training.optimizer]
+name = "adamw"
+lr = 0.001
+weight_decay = 0.0
+betas = [0.9, 0.999]
+
+[training.outputs]
+dir = "artifacts/checkpoints/run-01"
+save_last = true
+save_best = true
+best_monitor = "val/loss"
+
+[evaluation.run]
+name = "baseline-eval"
+device = "cpu"
+batch_size = 2
+num_workers = 0
+
+[evaluation.inputs]
+dataset_config = "configs/dataset.toml"
+model_config = "configs/model.toml"
+checkpoint_path = "artifacts/checkpoints/run-01/last.ckpt"
+
+[evaluation.metrics]
+compute_map = true
+compute_latency = false
+iou_thresholds = [0.5, 0.7]
+max_detections = 100
+
+[evaluation.output]
+dir = "artifacts/reports/eval"
+save_predictions = true
+save_per_scene = false
+
+[tui]
+enabled = true
+refresh_rate_ms = 250
+theme = "default"
+history_path = "artifacts/reports/tui/history.log"
+max_events = 2000
+
+[google_cloud]
+enabled = true
+project_id = "demo-project"
+region = "us-central1"
+bucket = "demo-bucket"
+credentials_path = ".xtask/gcloud/credentials.json"
