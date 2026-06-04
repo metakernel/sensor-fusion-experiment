@@ -353,11 +353,7 @@ impl ExtractionSummaryManifest {
                 )?;
             }
             if let Some(id) = &file.last_sample_id {
-                validate_sample_id(
-                    "extraction_summary",
-                    &format!("{label}.last_sample_id"),
-                    id,
-                )?;
+                validate_sample_id("extraction_summary", &format!("{label}.last_sample_id"), id)?;
             }
         }
         Ok(())
@@ -671,7 +667,10 @@ mod tests {
 
         let err = manifest.validate().unwrap_err();
 
-        assert!(err.to_string().contains("matched_pairs cannot exceed camera_frames"));
+        assert!(
+            err.to_string()
+                .contains("matched_pairs cannot exceed camera_frames")
+        );
     }
 
     fn temp_root(name: &str) -> PathBuf {

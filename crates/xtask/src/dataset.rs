@@ -4,8 +4,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use sfx_core::manifest::{
-    DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, MANIFEST_SCHEMA_VERSION,
-    ExtractionSummaryEntry, ExtractionSummaryManifest, ProcessedSampleManifest, RawFileEntry,
+    DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, ExtractionSummaryEntry,
+    ExtractionSummaryManifest, MANIFEST_SCHEMA_VERSION, ProcessedSampleManifest, RawFileEntry,
     RawFileManifest, SourceSplit, Split, SplitsManifest, read_manifest, write_manifest,
 };
 use sfx_waymo::{DiscoveryConfig, parse_gcloud_storage_listing, split_label};
@@ -125,10 +125,10 @@ fn fetch(args: DatasetFetchArgs, paths: &ProjectPaths) -> Result<()> {
     let mut all_files: Vec<RawFileEntry> = selected.clone();
     for comp in &args.extra_components {
         for file in &selected {
-            if let Some(companion) = companion_component_entry(file, comp) {
-                if !all_files.iter().any(|f| f.uri == companion.uri) {
-                    all_files.push(companion);
-                }
+            if let Some(companion) = companion_component_entry(file, comp)
+                && !all_files.iter().any(|f| f.uri == companion.uri)
+            {
+                all_files.push(companion);
             }
         }
     }
@@ -781,12 +781,15 @@ fn file_size(path: &Path) -> Result<u64> {
 fn local_source_path(uri: &str) -> Option<PathBuf> {
     let raw = uri.strip_prefix("file://")?;
     #[cfg(windows)]
-    let raw = raw
+    let raw = if raw
         .as_bytes()
         .get(0..3)
         .is_some_and(|prefix| prefix[0] == b'/' && prefix[2] == b':')
-        .then_some(&raw[1..])
-        .unwrap_or(raw);
+    {
+        &raw[1..]
+    } else {
+        raw
+    };
     Some(PathBuf::from(raw))
 }
 
@@ -892,7 +895,10 @@ fn parse_range_channels(values: &[String]) -> Result<Vec<sfx_preprocess::RangeCh
     Ok(channels)
 }
 
-fn resolve_processed_dir(dataset_arg: Option<&Path>, dataset_config: &sfx_config::DatasetConfig) -> PathBuf {
+fn resolve_processed_dir(
+    dataset_arg: Option<&Path>,
+    dataset_config: &sfx_config::DatasetConfig,
+) -> PathBuf {
     dataset_arg
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dataset_config.processed_dir.clone())
@@ -967,7 +973,10 @@ fn scan_suspicious_samples(
     Ok(report)
 }
 
-fn render_rgb_from_tensor(path: &Path, shape: &sfx_core::manifest::TensorShape) -> Result<image::RgbImage> {
+fn render_rgb_from_tensor(
+    path: &Path,
+    shape: &sfx_core::manifest::TensorShape,
+) -> Result<image::RgbImage> {
     let values = bytes_to_f32_le(&std::fs::read(path)?);
     let expected = shape.value_count();
     if values.len() != expected {
@@ -994,7 +1003,10 @@ fn render_rgb_from_tensor(path: &Path, shape: &sfx_core::manifest::TensorShape) 
         .ok_or_else(|| anyhow::anyhow!("failed to construct RGB image"))
 }
 
-fn render_range_from_tensor(path: &Path, shape: &sfx_core::manifest::TensorShape) -> Result<image::GrayImage> {
+fn render_range_from_tensor(
+    path: &Path,
+    shape: &sfx_core::manifest::TensorShape,
+) -> Result<image::GrayImage> {
     let values = bytes_to_f32_le(&std::fs::read(path)?);
     let expected = shape.value_count();
     if values.len() != expected {
@@ -1187,17 +1199,20 @@ fn compute_tensor_stats(
             .with_context(|| format!("reading {}", range_path.display()))?;
         let values = bytes_to_f32_le(&bytes);
         // Channel 0: first range_pixels values
-        for i in 0..range_pixels.min(values.len()) {
-            let v = values[i];
-            range0_acc.push(v);
-            if v > 0.0 {
+        for v in values.iter().take(range_pixels.min(values.len())) {
+            range0_acc.push(*v);
+            if *v > 0.0 {
                 valid_pixels += 1;
             }
             total_range_pixels += 1;
         }
         // Channel 1: next range_pixels values (if present)
-        for i in range_pixels..(2 * range_pixels).min(values.len()) {
-            range1_acc.push(values[i]);
+        for v in values
+            .iter()
+            .take((2 * range_pixels).min(values.len()))
+            .skip(range_pixels)
+        {
+            range1_acc.push(*v);
         }
     }
 
@@ -1548,7 +1563,10 @@ mod tests {
         let pairs = pair_component_parquet_files(&camera_files, &lidar_files);
 
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, PathBuf::from("raw/training/camera_image/b.parquet"));
+        assert_eq!(
+            pairs[0].0,
+            PathBuf::from("raw/training/camera_image/b.parquet")
+        );
         assert_eq!(pairs[0].1, PathBuf::from("raw/training/lidar/b.parquet"));
     }
 
@@ -1575,10 +1593,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(channels.len(), 3);
-        assert!(matches!(
-            channels[0],
-            sfx_preprocess::RangeChannel::Range
-        ));
+        assert!(matches!(channels[0], sfx_preprocess::RangeChannel::Range));
         assert!(matches!(
             channels[2],
             sfx_preprocess::RangeChannel::ValidityMask

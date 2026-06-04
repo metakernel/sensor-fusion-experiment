@@ -1,6 +1,11 @@
+mod compare;
 mod dataset;
+mod eval;
+mod export;
 mod gcloud;
+mod report;
 mod train;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -30,6 +35,17 @@ enum Command {
         command: DatasetCommand,
     },
     Train(TrainArgs),
+    Eval(EvalArgs),
+    Compare(CompareArgs),
+    Export(ExportArgs),
+    Report(ReportArgs),
+    Tui(TuiArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TuiArgs {
+    #[arg(long)]
+    pub(crate) dataset: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -161,6 +177,42 @@ pub(crate) struct TrainArgs {
     pub(crate) command: Option<TrainSubcommand>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct EvalArgs {
+    #[arg(long)]
+    pub(crate) run: Option<PathBuf>,
+    #[arg(long, default_value = "all")]
+    pub(crate) split: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CompareArgs {
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) runs: Vec<PathBuf>,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ExportArgs {
+    #[arg(long)]
+    pub(crate) run: Option<PathBuf>,
+    #[arg(long, default_value = "val")]
+    pub(crate) split: String,
+    #[arg(long, default_value_t = 16)]
+    pub(crate) n: usize,
+    #[arg(long, default_value = "artifacts/exports")]
+    pub(crate) out: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReportArgs {
+    #[arg(long)]
+    pub(crate) run: Option<PathBuf>,
+    #[arg(long, default_value = "artifacts/reports")]
+    pub(crate) out: PathBuf,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum TrainSubcommand {
     Resume(TrainResumeArgs),
@@ -240,6 +292,11 @@ fn main() -> Result<()> {
         Command::Gcloud { command } => gcloud::run(command, &paths),
         Command::Dataset { command } => dataset::run(command, &paths),
         Command::Train(args) => train::run(args, &paths),
+        Command::Eval(args) => eval::run(args, &paths),
+        Command::Compare(args) => compare::run(args, &paths),
+        Command::Export(args) => export::run(args, &paths),
+        Command::Report(args) => report::run(args, &paths),
+        Command::Tui(args) => tui::run(args, &paths),
     }
 }
 
@@ -275,6 +332,7 @@ impl ProjectPaths {
             self.root.join("data/processed/waymo-range-rgb-v1/test"),
             self.root.join("data/samples"),
             self.root.join("artifacts/checkpoints"),
+            self.root.join("artifacts/exports"),
             self.root.join("artifacts/metrics"),
             self.root.join("artifacts/previews"),
             self.root.join("artifacts/reports"),
@@ -539,4 +597,67 @@ pub(crate) fn display_from_root(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+pub(crate) fn resolve_run_dir(paths: &ProjectPaths, run: Option<&Path>) -> Result<Option<PathBuf>> {
+    if let Some(run) = run {
+        let candidate = sfx_config::resolve_from_root(&paths.root, run);
+        if candidate.is_dir() {
+            return Ok(Some(candidate));
+        }
+        if candidate.is_file() {
+            return Ok(candidate.parent().map(Path::to_path_buf));
+        }
+
+        if let Some(found) = find_run_dir_by_name(&paths.root, &run.to_string_lossy())? {
+            return Ok(Some(found));
+        }
+
+        return Ok(Some(candidate));
+    }
+
+    let latest_path = paths.root.join(".xtask/runs/latest.json");
+    if !latest_path.exists() {
+        return Ok(None);
+    }
+
+    let latest: LatestRun = read_manifest(&latest_path)
+        .with_context(|| format!("reading {}", latest_path.display()))?;
+    if let Some(path) = latest.path {
+        return Ok(Some(sfx_config::resolve_from_root(&paths.root, path)));
+    }
+    if let Some(run_id) = latest.run_id {
+        return find_run_dir_by_name(&paths.root, &run_id);
+    }
+
+    Ok(None)
+}
+
+fn find_run_dir_by_name(root: &Path, run_name: &str) -> Result<Option<PathBuf>> {
+    let run_name = run_name.trim();
+    if run_name.is_empty() {
+        return Ok(None);
+    }
+
+    let artifacts_runs = root.join("artifacts/runs").join(run_name);
+    if artifacts_runs.exists() {
+        return Ok(Some(artifacts_runs));
+    }
+
+    let checkpoints_dir = root.join("artifacts/checkpoints");
+    if !checkpoints_dir.exists() {
+        return Ok(None);
+    }
+
+    for entry in std::fs::read_dir(&checkpoints_dir)
+        .with_context(|| format!("reading {}", checkpoints_dir.display()))?
+    {
+        let entry = entry?;
+        let candidate = entry.path().join(run_name);
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
 }

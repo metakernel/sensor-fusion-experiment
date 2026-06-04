@@ -64,17 +64,9 @@ pub struct ExtractedPair {
     pub range_shape: [usize; 3],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AlignOptions {
     pub max_timestamp_delta_micros: i64,
-}
-
-impl Default for AlignOptions {
-    fn default() -> Self {
-        Self {
-            max_timestamp_delta_micros: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -121,7 +113,9 @@ pub fn align_frames_with_options(
             continue;
         };
 
-        if let Some((lid, abs_delta)) = pop_best_lidar(segment_timeline, cam.timestamp_micros, max_delta) {
+        if let Some((lid, abs_delta)) =
+            pop_best_lidar(segment_timeline, cam.timestamp_micros, max_delta)
+        {
             pairs.push(ExtractedPair {
                 segment: cam.segment.clone(),
                 timestamp_micros: cam.timestamp_micros,
@@ -147,21 +141,14 @@ fn pop_best_lidar(
     target_ts: i64,
     max_delta: i64,
 ) -> Option<(LidarFrame, i64)> {
-    let lower = timeline
-        .range(..=target_ts)
-        .next_back()
-        .map(|(&ts, _)| ts);
+    let lower = timeline.range(..=target_ts).next_back().map(|(&ts, _)| ts);
     let upper = timeline.range(target_ts..).next().map(|(&ts, _)| ts);
 
     let choose = match (lower, upper) {
         (Some(a), Some(b)) => {
             let da = (target_ts - a).abs();
             let db = (target_ts - b).abs();
-            if da <= db {
-                (a, da)
-            } else {
-                (b, db)
-            }
+            if da <= db { (a, da) } else { (b, db) }
         }
         (Some(a), None) => (a, (target_ts - a).abs()),
         (None, Some(b)) => (b, (target_ts - b).abs()),
@@ -199,7 +186,13 @@ pub fn write_sample(
     split: &Split,
     sample_idx: usize,
 ) -> Result<ProcessedSampleEntry> {
-    write_sample_with_options(output_dir, pair, split, sample_idx, &ProcessOptions::default())
+    write_sample_with_options(
+        output_dir,
+        pair,
+        split,
+        sample_idx,
+        &ProcessOptions::default(),
+    )
 }
 
 pub fn write_sample_with_options(
@@ -223,14 +216,19 @@ pub fn write_sample_with_options(
     let preview_range_path = sample_dir.join("preview_range.png");
 
     // --- RGB: decode JPEG → resize [H, W] → normalise → CHW f32 binary ---
-    let rgb_chw =
-        process_rgb(&pair.jpeg_bytes, options.rgb_height, options.rgb_width).context("processing RGB frame")?;
+    let rgb_chw = process_rgb(&pair.jpeg_bytes, options.rgb_height, options.rgb_width)
+        .context("processing RGB frame")?;
     let rgb_bytes: Vec<u8> = rgb_chw.iter().flat_map(|f| f.to_le_bytes()).collect();
     std::fs::write(&rgb_path, &rgb_bytes)
         .with_context(|| format!("writing {}", rgb_path.display()))?;
 
-    write_rgb_preview(&rgb_chw, options.rgb_height, options.rgb_width, &preview_rgb_path)
-        .with_context(|| format!("writing {}", preview_rgb_path.display()))?;
+    write_rgb_preview(
+        &rgb_chw,
+        options.rgb_height,
+        options.rgb_width,
+        &preview_rgb_path,
+    )
+    .with_context(|| format!("writing {}", preview_rgb_path.display()))?;
 
     // --- Range: extract channels [0,1] → resize width → normalise → CHW f32 binary ---
     let range_chw = process_range(
@@ -245,8 +243,13 @@ pub fn write_sample_with_options(
     std::fs::write(&range_path, &range_bytes)
         .with_context(|| format!("writing {}", range_path.display()))?;
 
-    write_range_preview(&range_chw, options.range_height, options.range_width, &preview_range_path)
-        .with_context(|| format!("writing {}", preview_range_path.display()))?;
+    write_range_preview(
+        &range_chw,
+        options.range_height,
+        options.range_width,
+        &preview_range_path,
+    )
+    .with_context(|| format!("writing {}", preview_range_path.display()))?;
 
     let meta = MultimodalSampleMeta {
         id: SampleId(sample_id),

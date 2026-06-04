@@ -137,7 +137,12 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         &manifest_path,
         Some(Split::Val),
     )
-    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    .with_context(|| {
+        format!(
+            "opening validation dataset from {}",
+            manifest_path.display()
+        )
+    })?;
     if !val_dataset.is_empty() {
         val_dataset.validate_tensor_files()?;
     }
@@ -396,7 +401,12 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         &manifest_path,
         Some(Split::Val),
     )
-    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    .with_context(|| {
+        format!(
+            "opening validation dataset from {}",
+            manifest_path.display()
+        )
+    })?;
     if !val_dataset.is_empty() {
         val_dataset.validate_tensor_files()?;
     }
@@ -562,7 +572,12 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         &manifest_path,
         Some(Split::Val),
     )
-    .with_context(|| format!("opening validation dataset from {}", manifest_path.display()))?;
+    .with_context(|| {
+        format!(
+            "opening validation dataset from {}",
+            manifest_path.display()
+        )
+    })?;
     if !val_dataset.is_empty() {
         val_dataset.validate_tensor_files()?;
     }
@@ -615,7 +630,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
             let batch = batch?.into_burn::<TrainBackend>(&device);
             let current_batch_size = batch.batch_size();
             batch_count += 1;
-            if batch_count == 1 || batch_count % 5 == 0 || batch_count == batches_per_epoch {
+            if batch_count == 1 || batch_count.is_multiple_of(5) || batch_count == batches_per_epoch
+            {
                 println!(
                     "epoch {epoch:03}/{:03} batch {batch_count}/{batches_per_epoch}",
                     config.epochs
