@@ -13,8 +13,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sfx-config = { workspace = true }
 sfx-core = { workspace = true }
+sfx-data = { workspace = true }
 sfx-eval = { workspace = true }
 sfx-preprocess = { workspace = true }
 sfx-train = { workspace = true }
 sfx-tui = { workspace = true }
 sfx-waymo = { workspace = true }
+
+[dev-dependencies]
+sfx-core = { workspace = true }
+tempfile = "3"

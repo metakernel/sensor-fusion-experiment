@@ -7,10 +7,10 @@ A research implementation of a multimodal autoencoder fusing RGB camera and LiDA
 - Trains separate range-only, RGB-only, and fusion autoencoders.
 - Uses a shared latent space for multimodal fusion with dual-modality reconstruction.
 - Produces deterministic processed splits from a fixed dataset config and uses seeded training batches.
-- Exposes an `xtask` CLI for setup, Google Cloud access, dataset listing/fetch/prepare/inspect/preview, and model training.
+- Exposes an `xtask` CLI for setup, Google Cloud access, dataset listing/fetch/prepare/inspect/preview, model training, evaluation, comparison, export, and reporting.
 - Stores generated data, credentials, and run artifacts outside version control in `.xtask/`, `data/`, and `artifacts/`.
 
-> Note: this branch does **not** expose top-level `cargo xtask eval`, `compare`, `export`, or `report` commands in `crates/xtask/src/main.rs`. Training runs still emit machine-readable metrics, summaries, checkpoints, and preview images that support manual evaluation and comparison.
+> Note: `cargo xtask eval`, `compare`, `export`, and `report` load trained checkpoints through the `sfx-train` inference layer, so metrics, visualizations, comparisons, and reports reflect real `model.bin` reconstructions.
 
 ## Prerequisites
 
@@ -84,29 +84,35 @@ Each run creates a directory under `artifacts/checkpoints/<model-kind>/<run-id>/
 
 ### 8. Evaluate trained runs
 
-There is no standalone `cargo xtask eval` command on this branch yet. Instead, inspect the generated run artifacts:
+```bash
+cargo xtask eval --run artifacts/checkpoints/fusion/<run-id> --split all
+```
 
-- `summary.json` for final loss, run metadata, dataset/model config paths, and output locations
-- `metrics.jsonl` for per-epoch train/validation losses
-- `previews/` for qualitative reconstructions written during training
+Evaluation loads the run's `model.bin`, runs checkpoint-backed inference over the selected split (`all`, `train`, `val`, or `test`), prints a metric table, and writes `<run_dir>/eval/<split>.{json,csv,md}`. Metrics include MSE, MAE, RMSE, PSNR, and SSIM for RGB reconstructions.
 
 ### 9. Compare runs
 
-There is no standalone `cargo xtask compare` subcommand yet. Compare the `summary.json` and `metrics.jsonl` files from multiple run directories to review loss curves and final metrics side by side.
+```bash
+cargo xtask compare --runs artifacts/checkpoints/range/<run-a>,artifacts/checkpoints/fusion/<run-b> --out artifacts/reports/compare.md
+```
+
+Comparison prints a Markdown table of run summaries and optionally writes it with `--out`. When `<run_dir>/eval/*.json` exists, the table appends evaluation columns for the detected split, including RGB MSE/PSNR/SSIM and range MSE/PSNR.
 
 ### 10. Export visualizations
 
-Dataset previews are available today via:
-
 ```bash
-cargo xtask dataset preview --split train --count 16 --out artifacts/previews/dataset
+cargo xtask export --run artifacts/checkpoints/fusion/<run-id> --split val --n 16 --out artifacts/exports/fusion-val
 ```
 
-Training also writes per-run preview images under each run directory's `previews/` folder.
+Export loads the checkpoint and writes triptych preview images to `--out`: `<sample>_rgb.ppm` for RGB reconstructions and/or `<sample>_range.pgm` for range reconstructions. Each triptych shows original, reconstructed, and absolute-error panels.
 
 ### 11. Generate reports
 
-This branch writes structured JSON/JSONL outputs that can be consumed by external notebooks or scripts. The dedicated `cargo xtask report` workflow described in planning documents is not exposed as a CLI command yet.
+```bash
+cargo xtask report --run artifacts/checkpoints/fusion/<run-id> --out artifacts/reports
+```
+
+Report generation writes `artifacts/reports/report.md` by default. The report includes training configuration, curves, final metrics, a `## Evaluation` section populated from `<run_dir>/eval/*.json`, and a `## Previews` section listing images under `<run_dir>/previews`.
 
 ## Project Structure
 
@@ -118,10 +124,10 @@ The repository is a Rust workspace with focused crates under `crates/`:
 - `sfx-waymo`: Waymo-specific discovery, download, and extraction utilities
 - `sfx-preprocess`: camera/LiDAR alignment, normalization, resizing, and preview generation
 - `sfx-models`: range-only, RGB-only, and fusion autoencoder definitions
-- `sfx-train`: training loops, run directory management, checkpointing, metrics, and previews
+- `sfx-train`: training loops, run directory management, checkpointing, inference, metrics, and previews
 - `sfx-eval`: evaluation-related building blocks used by the wider workspace
 - `sfx-tui`: terminal-oriented dataset exploration components
-- `xtask`: the operational CLI entry point for setup, data, auth, and training tasks
+- `xtask`: the operational CLI entry point for setup, data, auth, training, evaluation, export, comparison, and reporting tasks
 
 See `docs/architecture.md` for the high-level crate map.
 
@@ -136,7 +142,7 @@ Configuration lives in `configs/`:
 - `train.range-only.toml`, `train.rgb-only.toml`, `train.fusion.toml`: baseline training entry points
 - `train.debug.toml`: small fusion debug profile for fast smoke runs
 - `train.nextai.toml`: additional training profile kept alongside the main presets
-- `eval.default.toml`: evaluation configuration scaffold kept in the workspace even though `xtask` does not currently expose a top-level `eval` command
+- `eval.default.toml`: evaluation configuration scaffold kept in the workspace for evaluation workflows
 
 Key training parameters are grouped under `[train]` (`run_name`, `batch_size`, `learning_rate`, `epochs`, `seed`) and then reference dataset/model config files through `[dataset].config` and `[model].config`.
 

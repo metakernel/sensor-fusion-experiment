@@ -19,6 +19,9 @@ use sfx_models::{
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod inference;
+pub use inference::{Reconstruction, RunInference};
+
 pub const CRATE_NAME: &str = "sfx-train";
 
 type InnerBackend = Flex;
@@ -59,6 +62,8 @@ pub struct TrainingSummary {
     #[serde(default)]
     pub max_batches_per_epoch: Option<usize>,
     pub latent_dim: usize,
+    #[serde(default)]
+    pub z_modality: Option<usize>,
     pub final_train_loss: f64,
     #[serde(default)]
     pub final_val_loss: Option<f64>,
@@ -267,6 +272,7 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         batch_size: config.batch_size,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
+        z_modality: None,
         final_train_loss,
         final_val_loss,
         backend: "burn-flex-autodiff".to_string(),
@@ -531,6 +537,7 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         batch_size: config.batch_size,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
+        z_modality: None,
         final_train_loss,
         final_val_loss,
         backend: "burn-flex-autodiff".to_string(),
@@ -725,6 +732,7 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         batch_size: config.batch_size,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
+        z_modality: Some(config.model.effective_z_modality()),
         final_train_loss,
         final_val_loss,
         backend: "burn-flex-autodiff".to_string(),

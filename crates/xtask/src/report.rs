@@ -1,7 +1,9 @@
 use crate::{ProjectPaths, ReportArgs, display_from_root, resolve_run_dir};
 use anyhow::{Context, Result};
+use sfx_eval::{AggregatedMetrics, SplitEvalSummary};
 use sfx_train::TrainingSummary;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn run(args: ReportArgs, paths: &ProjectPaths) -> Result<()> {
     let Some(run_dir) = resolve_run_dir(paths, args.run.as_deref())? else {
@@ -33,7 +35,7 @@ pub(crate) fn run(args: ReportArgs, paths: &ProjectPaths) -> Result<()> {
         .collect::<Result<_>>()?;
 
     let train_curve: Vec<f64> = metrics.iter().map(|metric| metric.train_loss).collect();
-    let report = build_report(&summary, &train_curve);
+    let report = build_report(&summary, &train_curve, &paths.root, &run_dir)?;
 
     let out_dir = sfx_config::resolve_from_root(&paths.root, &args.out);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
@@ -51,7 +53,12 @@ struct EpochMetric {
     train_loss: f64,
 }
 
-fn build_report(summary: &TrainingSummary, train_curve: &[f64]) -> String {
+fn build_report(
+    summary: &TrainingSummary,
+    train_curve: &[f64],
+    root: &Path,
+    run_dir: &Path,
+) -> Result<String> {
     let mut markdown = String::new();
     markdown.push_str(&format!("# {}\n\n", summary.run_name));
     markdown.push_str("## Config\n\n");
@@ -78,8 +85,149 @@ fn build_report(summary: &TrainingSummary, train_curve: &[f64]) -> String {
             .map(|value| format!("{value:.6}"))
             .unwrap_or_else(|| "n/a".to_string())
     ));
-    markdown.push_str(&format!("| Status | {} |\n", summary.status));
-    markdown
+    markdown.push_str(&format!("| Status | {} |\n\n", summary.status));
+
+    append_evaluation_section(&mut markdown, run_dir)?;
+    append_previews_section(&mut markdown, root, run_dir)?;
+
+    Ok(markdown)
+}
+
+fn append_evaluation_section(markdown: &mut String, run_dir: &Path) -> Result<()> {
+    markdown.push_str("## Evaluation\n\n");
+
+    let eval_dir = run_dir.join("eval");
+    let mut found_eval = false;
+    for split in ["train", "val", "test"] {
+        let eval_path = eval_dir.join(format!("{split}.json"));
+        if !eval_path.exists() {
+            continue;
+        }
+
+        if !found_eval {
+            markdown
+                .push_str("| Split | Modality | Mean MSE | Mean PSNR | Mean SSIM | Samples |\n");
+            markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: |\n");
+            found_eval = true;
+        }
+
+        let eval_file = fs::File::open(&eval_path)
+            .with_context(|| format!("opening {}", eval_path.display()))?;
+        let summary: SplitEvalSummary = serde_json::from_reader(eval_file)
+            .with_context(|| format!("parsing {}", eval_path.display()))?;
+        let split_label = if summary.split.is_empty() {
+            split
+        } else {
+            &summary.split
+        };
+
+        if let Some(rgb) = &summary.rgb {
+            markdown.push_str(&evaluation_row(split_label, "RGB", rgb, summary.n_samples));
+        }
+        if let Some(range) = &summary.range {
+            markdown.push_str(&evaluation_row(
+                split_label,
+                "Range",
+                range,
+                summary.n_samples,
+            ));
+        }
+    }
+
+    if !found_eval {
+        markdown.push_str("_No evaluation metrics found. Run `cargo xtask eval`._\n");
+    }
+    markdown.push('\n');
+
+    Ok(())
+}
+
+fn evaluation_row(
+    split: &str,
+    modality: &str,
+    metrics: &AggregatedMetrics,
+    n_samples: usize,
+) -> String {
+    format!(
+        "| {} | {} | {} | {} | {} | {} |\n",
+        split,
+        modality,
+        format_metric(metrics.mean_mse),
+        format_metric(metrics.mean_psnr_db),
+        format_optional_metric(metrics.mean_ssim),
+        n_samples
+    )
+}
+
+fn append_previews_section(markdown: &mut String, root: &Path, run_dir: &Path) -> Result<()> {
+    markdown.push_str("## Previews\n\n");
+
+    let previews_dir = run_dir.join("previews");
+    let preview_paths = collect_preview_images(&previews_dir)?;
+    if preview_paths.is_empty() {
+        markdown.push_str("_No preview images found. Run `cargo xtask export`._\n");
+    } else {
+        for path in preview_paths {
+            let display_path = display_from_root(root, &path);
+            markdown.push_str(&format!("- [{display_path}]({display_path})\n"));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_preview_images(previews_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !previews_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = Vec::new();
+    for entry in
+        fs::read_dir(previews_dir).with_context(|| format!("reading {}", previews_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {} entry", previews_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && is_image_path(&path) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let right_name = right
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        left_name.cmp(&right_name)
+    });
+    Ok(paths)
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "bmp" | "gif" | "jpeg" | "jpg" | "pgm" | "png" | "ppm" | "tif" | "tiff" | "webp"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn format_metric(value: f32) -> String {
+    if value.is_infinite() && value.is_sign_positive() {
+        "inf".to_string()
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn format_optional_metric(value: Option<f32>) -> String {
+    value.map(format_metric).unwrap_or_else(|| "-".to_string())
 }
 
 fn sparkline(values: &[f64]) -> String {

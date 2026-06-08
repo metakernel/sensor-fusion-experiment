@@ -2,8 +2,12 @@ use crate::{ExportArgs, ProjectPaths, display_from_root, resolve_run_dir};
 use anyhow::{Context, Result, anyhow, ensure};
 use image::{GrayImage, Luma, Rgb, RgbImage};
 use sfx_core::manifest::{ProcessedSampleManifest, Split, TensorShape, read_manifest};
+use sfx_data::{BatchOptions, FusionDataset};
+use sfx_train::RunInference;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+const EXPORT_BATCH: usize = 8;
 
 pub(crate) fn run(args: ExportArgs, paths: &ProjectPaths) -> Result<()> {
     let manifest_path = paths.processed_sample_manifest_path();
@@ -27,52 +31,61 @@ pub(crate) fn run(args: ExportArgs, paths: &ProjectPaths) -> Result<()> {
     let out_dir = sfx_config::resolve_from_root(&paths.root, &args.out);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
-    let selected: Vec<_> = manifest
-        .samples
-        .iter()
-        .filter(|sample| sample.meta.split == split)
-        .take(args.n)
-        .collect();
+    let inferer = RunInference::load(&run_dir).context("loading run checkpoint")?;
+    let dataset = FusionDataset::open_split(&processed_dir, &manifest_path, Some(split))
+        .with_context(|| format!("opening {} dataset", args.split))?;
 
     let mut written_files = 0usize;
-    for sample in selected {
-        if let Some(shape) = manifest.rgb_shape.as_ref() {
-            let truth = load_tensor(
-                &processed_dir.join(&sample.meta.rgb_path),
-                shape.value_count(),
-            )?;
-            // TODO: replace zero reconstruction with Burn checkpoint loading from run_dir.
-            let reconstructed = vec![0.0; truth.len()];
-            let error: Vec<f32> = truth
-                .iter()
-                .zip(reconstructed.iter())
-                .map(|(original, predicted)| (original - predicted).abs() * 4.0)
-                .collect();
-            let triptych = rgb_triptych(&truth, &reconstructed, &error, shape)?;
-            let rgb_path = out_dir.join(format!("{}_rgb.ppm", sample.meta.id.0));
-            triptych
-                .save(&rgb_path)
-                .with_context(|| format!("writing {}", rgb_path.display()))?;
-            written_files += 1;
-        }
+    let mut produced_samples = 0usize;
+    'outer: for batch in dataset.batches(BatchOptions::new(EXPORT_BATCH))? {
+        let batch = batch?;
+        let recon = inferer.reconstruct(&batch)?;
+        let rgb_values_per_sample = batch.rgb_shape.value_count();
+        let range_values_per_sample = batch.range_shape.value_count();
 
-        if let Some(shape) = manifest.range_shape.as_ref() {
-            let truth = load_tensor(
-                &processed_dir.join(&sample.meta.range_path),
-                shape.value_count(),
-            )?;
-            let reconstructed = vec![0.0; truth.len()];
-            let error: Vec<f32> = truth
-                .iter()
-                .zip(reconstructed.iter())
-                .map(|(original, predicted)| (original - predicted).abs() * 4.0)
-                .collect();
-            let triptych = range_triptych(&truth, &reconstructed, &error, shape)?;
-            let range_path = out_dir.join(format!("{}_range.pgm", sample.meta.id.0));
-            triptych
-                .save(&range_path)
-                .with_context(|| format!("writing {}", range_path.display()))?;
-            written_files += 1;
+        for index in 0..batch.batch_size() {
+            if produced_samples >= args.n {
+                break 'outer;
+            }
+            produced_samples += 1;
+            let id = &batch.sample_ids[index].0;
+
+            if let (Some(shape), Some(hat)) = (manifest.rgb_shape.as_ref(), recon.rgb_hat.as_ref())
+            {
+                let start = index * rgb_values_per_sample;
+                let end = start + rgb_values_per_sample;
+                let truth = &batch.rgb[start..end];
+                let reconstructed = &hat[start..end];
+                let error: Vec<f32> = truth
+                    .iter()
+                    .zip(reconstructed.iter())
+                    .map(|(original, predicted)| (*original - *predicted).abs() * 4.0)
+                    .collect();
+                let rgb_path = out_dir.join(format!("{id}_rgb.ppm"));
+                rgb_triptych(truth, reconstructed, &error, shape)?
+                    .save(&rgb_path)
+                    .with_context(|| format!("writing {}", rgb_path.display()))?;
+                written_files += 1;
+            }
+
+            if let (Some(shape), Some(hat)) =
+                (manifest.range_shape.as_ref(), recon.range_hat.as_ref())
+            {
+                let start = index * range_values_per_sample;
+                let end = start + range_values_per_sample;
+                let truth = &batch.range[start..end];
+                let reconstructed = &hat[start..end];
+                let error: Vec<f32> = truth
+                    .iter()
+                    .zip(reconstructed.iter())
+                    .map(|(original, predicted)| (*original - *predicted).abs() * 4.0)
+                    .collect();
+                let range_path = out_dir.join(format!("{id}_range.pgm"));
+                range_triptych(truth, reconstructed, &error, shape)?
+                    .save(&range_path)
+                    .with_context(|| format!("writing {}", range_path.display()))?;
+                written_files += 1;
+            }
         }
     }
 
@@ -117,28 +130,6 @@ fn resolve_processed_dir(paths: &ProjectPaths, manifest: &ProcessedSampleManifes
     }
 
     paths.root.join("data").join("processed")
-}
-
-fn load_tensor(path: &Path, expected_len: usize) -> Result<Vec<f32>> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    ensure!(
-        bytes.len() % 4 == 0,
-        "{} has {} trailing bytes; expected f32-aligned data",
-        path.display(),
-        bytes.len() % 4
-    );
-    let floats: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    ensure!(
-        floats.len() == expected_len,
-        "{} has {} values; expected {}",
-        path.display(),
-        floats.len(),
-        expected_len
-    );
-    Ok(floats)
 }
 
 fn rgb_triptych(
