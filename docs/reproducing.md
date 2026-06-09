@@ -161,6 +161,18 @@ cargo xtask train --config configs/train.debug.toml
 
 Every run also writes `config.toml`, `dataset.toml`, `model.toml`, `optimizer.json`, and `previews/` inside the run directory.
 
+### Segment-holdout headline retraining (5/1/2)
+
+```bash
+cargo xtask train --config configs/train.range-only.holdout.toml
+cargo xtask train --config configs/train.rgb-only.holdout.toml
+cargo xtask train --config configs/train.fusion.holdout.toml
+```
+
+These configs pin `seed = 42`, use the segment assignment in
+`artifacts/bench/audit/splits.segment_holdout.json`, and read split labels from
+`.xtask/manifests/processed_samples.segment_holdout.json`.
+
 ## Step 6: Evaluation
 
 This branch evaluates runs through the training artifacts rather than a dedicated `xtask eval` subcommand.

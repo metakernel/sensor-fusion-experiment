@@ -5130,6 +5130,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sfx-bench"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "sfx-config"
 version = "0.1.0"
 dependencies = [
@@ -6948,6 +6958,7 @@ dependencies = [
  "image",
  "serde",
  "serde_json",
+ "sfx-bench",
  "sfx-config",
  "sfx-core",
  "sfx-data",
