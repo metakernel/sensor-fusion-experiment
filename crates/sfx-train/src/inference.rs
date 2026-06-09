@@ -2,7 +2,7 @@ use crate::{InnerBackend, TrainingSummary, tensor_values};
 use anyhow::{Context, Result, bail};
 use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings};
-use burn::tensor::Device;
+use burn::tensor::{Device, Tensor, TensorData, backend::Backend};
 use sfx_config::ModelKind;
 use sfx_core::manifest::TensorShape;
 use sfx_data::FusionBatch;
@@ -30,6 +30,13 @@ pub struct Reconstruction {
     pub sample_ids: Vec<String>,
     pub rgb_hat: Option<Vec<f32>>,
     pub range_hat: Option<Vec<f32>>,
+}
+
+/// Contiguous latent embeddings, one row per sample in the incoming batch.
+pub struct Embedding {
+    pub sample_ids: Vec<String>,
+    pub z: Vec<f32>,
+    pub dim: usize,
 }
 
 impl RunInference {
@@ -139,6 +146,51 @@ impl RunInference {
             range_hat,
         })
     }
+
+    /// Validates shapes, runs forward, returns per-sample-contiguous latent embeddings.
+    pub fn embed(&self, batch: &FusionBatch) -> Result<Embedding> {
+        validate_shape("rgb", &batch.rgb_shape, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH)?;
+        validate_shape(
+            "range",
+            &batch.range_shape,
+            RANGE_CHANNELS,
+            RANGE_HEIGHT,
+            RANGE_WIDTH,
+        )?;
+        let batch_size = batch.batch_size();
+        ensure_len(
+            "rgb",
+            batch.rgb.len(),
+            batch_size * batch.rgb_shape.value_count(),
+        )?;
+        ensure_len(
+            "range",
+            batch.range.len(),
+            batch_size * batch.range_shape.value_count(),
+        )?;
+
+        let burn = batch.clone().into_burn::<InnerBackend>(&self.device);
+        let sample_ids = burn.sample_ids.iter().map(|id| id.0.clone()).collect();
+        let (z, dim) = match &self.model {
+            LoadedModel::Range(model) => {
+                let output = model.forward(burn.range);
+                let [_, dim] = output.z.dims();
+                (embedding_values(output.z)?, dim)
+            }
+            LoadedModel::Rgb(model) => {
+                let output = model.forward(burn.rgb);
+                let [_, dim] = output.z.dims();
+                (embedding_values(output.z)?, dim)
+            }
+            LoadedModel::Fusion(model) => {
+                let output = model.forward(burn.rgb, burn.range);
+                let [_, dim] = output.z_shared.dims();
+                (embedding_values(output.z_shared)?, dim)
+            }
+        };
+
+        Ok(Embedding { sample_ids, z, dim })
+    }
 }
 
 fn read_summary(run_dir: &Path) -> Result<TrainingSummary> {
@@ -180,6 +232,12 @@ fn ensure_len(label: &str, got: usize, want: usize) -> Result<()> {
         bail!("{label} tensor has {got} values; expected {want}");
     }
     Ok(())
+}
+
+fn embedding_values<B: Backend>(tensor: Tensor<B, 2>) -> Result<Vec<f32>> {
+    TensorData::convert::<f32>(tensor.to_data())
+        .to_vec::<f32>()
+        .context("converting embedding tensor data to f32 values")
 }
 
 #[cfg(test)]
@@ -236,6 +294,47 @@ mod tests {
             recon.range_hat.as_deref().expect("range emits range"),
             batch.batch_size() * batch.range_shape.value_count(),
         );
+        Ok(())
+    }
+
+    #[test]
+    fn embeds_fusion_checkpoint_with_expected_dim_and_is_deterministic() -> Result<()> {
+        let root = test_root("fusion-embed");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::Fusion, LATENT_DIM, Some(Z_MODALITY), true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        let first = infer.embed(&batch)?;
+        assert_embedding(&first, &batch, LATENT_DIM);
+
+        let second = infer.embed(&batch)?;
+        assert_eq!(second.sample_ids, first.sample_ids);
+        assert_eq!(second.dim, first.dim);
+        assert_eq!(second.z, first.z);
+        Ok(())
+    }
+
+    #[test]
+    fn embeds_range_checkpoint_with_expected_dim() -> Result<()> {
+        let root = test_root("range-embed");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::RangeOnly, LATENT_DIM, None, false)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        let embedding = infer.embed(&batch)?;
+        assert_embedding(&embedding, &batch, LATENT_DIM);
+        Ok(())
+    }
+
+    #[test]
+    fn embeds_rgb_checkpoint_with_expected_dim() -> Result<()> {
+        let root = test_root("rgb-embed");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::RgbOnly, LATENT_DIM, None, true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        let embedding = infer.embed(&batch)?;
+        assert_embedding(&embedding, &batch, LATENT_DIM);
         Ok(())
     }
 
@@ -301,6 +400,8 @@ mod tests {
             config_path: run_dir.join("config.toml"),
             dataset_config_path: run_dir.join("dataset.toml"),
             model_config_path: run_dir.join("model.toml"),
+            dataset_manifest_path: run_dir.join("processed_samples.json"),
+            split_protocol: "mixed".to_string(),
             metrics_path: run_dir.join("metrics.jsonl"),
             summary_path: summary_path.clone(),
             checkpoint_path: run_dir.join("model.bin"),
@@ -308,6 +409,8 @@ mod tests {
             epochs: 1,
             train_samples: 2,
             batch_size: 2,
+            learning_rate: 0.001,
+            seed: 42,
             max_batches_per_epoch: Some(1),
             latent_dim,
             z_modality,
@@ -418,6 +521,17 @@ mod tests {
                 .iter()
                 .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
         );
+    }
+
+    fn assert_embedding(embedding: &Embedding, batch: &FusionBatch, expected_dim: usize) {
+        assert_eq!(embedding.sample_ids, sample_id_strings(batch));
+        assert_eq!(embedding.dim, expected_dim);
+        assert_embedding_values(&embedding.z, batch.batch_size() * expected_dim);
+    }
+
+    fn assert_embedding_values(values: &[f32], expected_len: usize) {
+        assert_eq!(values.len(), expected_len);
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 
     fn sample_id_strings(batch: &FusionBatch) -> Vec<String> {

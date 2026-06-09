@@ -1,0 +1,29 @@
+seeds = [7, 42, 1337]
+classes = ["vehicle", "pedestrian", "cyclist"]
+
+[bench]
+name = "waymo-benchmark-v0"
+artifacts_dir = "artifacts/bench"
+
+[[protocols]]
+name = "linear-probe-val"
+split = "val"
+baselines = ["range-only", "rgb-only", "fusion"]
+tasks = ["classification", "regression"]
+
+[[protocols]]
+name = "reconstruction-test"
+split = "test"
+baselines = ["range-only", "rgb-only", "fusion"]
+tasks = ["reconstruction"]
+
+[probe]
+kind = "linear"
+max_iters = 200
+l2 = 0.001
+balance_classes = true
+
+[recon]
+batch_size = 8
+metrics = ["mse", "mae", "rmse", "psnr", "ssim", "depth-mae-m", "depth-rmse-m", "delta-1.25", "delta-1.25^2", "valid-pixel-fraction"]
+save_previews = false

@@ -28,12 +28,16 @@ pub struct DatasetConfig {
     pub name: String,
     pub raw_dir: PathBuf,
     pub processed_dir: PathBuf,
+    #[serde(default)]
+    pub processed_manifest_path: Option<PathBuf>,
     pub rgb_size: [usize; 2],
     pub range_size: [usize; 2],
     pub range_channels: Vec<String>,
     pub train_ratio: f32,
     pub val_ratio: f32,
     pub test_ratio: f32,
+    #[serde(default = "default_split_protocol")]
+    pub split_protocol: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -107,6 +111,10 @@ impl Default for TuiConfig {
 
 fn default_tui_split() -> String {
     "test".to_string()
+}
+
+fn default_split_protocol() -> String {
+    "mixed".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -285,6 +293,9 @@ fn load_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 fn resolve_dataset_paths(root: &Path, dataset: &mut DatasetConfig) {
     dataset.raw_dir = resolve_from_root(root, &dataset.raw_dir);
     dataset.processed_dir = resolve_from_root(root, &dataset.processed_dir);
+    if let Some(path) = dataset.processed_manifest_path.clone() {
+        dataset.processed_manifest_path = Some(resolve_from_root(root, path));
+    }
 }
 
 fn validate_dataset(path: &Path, config: &DatasetConfig) -> Result<()> {
@@ -340,6 +351,18 @@ fn validate_dataset(path: &Path, config: &DatasetConfig) -> Result<()> {
         config.test_ratio >= 0.0,
         "test_ratio cannot be negative",
     )?;
+    ensure(
+        path,
+        !config.split_protocol.trim().is_empty(),
+        "split_protocol is required",
+    )?;
+    if let Some(manifest_path) = &config.processed_manifest_path {
+        ensure(
+            path,
+            !manifest_path.as_os_str().is_empty(),
+            "processed_manifest_path cannot be empty",
+        )?;
+    }
     let sum = config.train_ratio + config.val_ratio + config.test_ratio;
     ensure(
         path,

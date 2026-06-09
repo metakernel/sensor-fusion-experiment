@@ -1,6 +1,6 @@
 use crate::{ProjectPaths, ReportArgs, display_from_root, resolve_run_dir};
 use anyhow::{Context, Result};
-use sfx_eval::{AggregatedMetrics, SplitEvalSummary};
+use sfx_eval::{AggregatedMetrics, AggregatedRangeDepthMetrics, SplitEvalSummary};
 use sfx_train::TrainingSummary;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,8 +106,8 @@ fn append_evaluation_section(markdown: &mut String, run_dir: &Path) -> Result<()
 
         if !found_eval {
             markdown
-                .push_str("| Split | Modality | Mean MSE | Mean PSNR | Mean SSIM | Samples |\n");
-            markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: |\n");
+                .push_str("| Split | Modality | Mean MSE | Mean Proxy PSNR | Mean Proxy SSIM | Mean Depth MAE (m) | Mean Valid Fraction | Samples |\n");
+            markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
             found_eval = true;
         }
 
@@ -122,13 +122,20 @@ fn append_evaluation_section(markdown: &mut String, run_dir: &Path) -> Result<()
         };
 
         if let Some(rgb) = &summary.rgb {
-            markdown.push_str(&evaluation_row(split_label, "RGB", rgb, summary.n_samples));
+            markdown.push_str(&evaluation_row(
+                split_label,
+                "RGB",
+                rgb,
+                None,
+                summary.n_samples,
+            ));
         }
         if let Some(range) = &summary.range {
             markdown.push_str(&evaluation_row(
                 split_label,
                 "Range",
                 range,
+                summary.range_depth.as_ref(),
                 summary.n_samples,
             ));
         }
@@ -146,15 +153,18 @@ fn evaluation_row(
     split: &str,
     modality: &str,
     metrics: &AggregatedMetrics,
+    range_depth: Option<&AggregatedRangeDepthMetrics>,
     n_samples: usize,
 ) -> String {
     format!(
-        "| {} | {} | {} | {} | {} | {} |\n",
+        "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
         split,
         modality,
         format_metric(metrics.mean_mse),
         format_metric(metrics.mean_psnr_db),
         format_optional_metric(metrics.mean_ssim),
+        format_optional_metric(range_depth.and_then(|metrics| metrics.mean_depth_mae_m)),
+        format_optional_metric(range_depth.map(|metrics| metrics.mean_valid_pixel_fraction)),
         n_samples
     )
 }

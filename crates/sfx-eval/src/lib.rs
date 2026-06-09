@@ -19,6 +19,8 @@ pub struct SampleEvalResult {
     pub sample_id: String,
     pub rgb_metrics: Option<ModalityMetrics>,
     pub range_metrics: Option<ModalityMetrics>,
+    #[serde(default)]
+    pub range_depth_metrics: Option<RangeDepthMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,6 +29,8 @@ pub struct SplitEvalSummary {
     pub n_samples: usize,
     pub rgb: Option<AggregatedMetrics>,
     pub range: Option<AggregatedMetrics>,
+    #[serde(default)]
+    pub range_depth: Option<AggregatedRangeDepthMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,6 +42,32 @@ pub struct AggregatedMetrics {
     #[serde(default)]
     pub mean_ssim: Option<f32>,
     pub std_mse: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RangeDepthMetrics {
+    #[serde(default)]
+    pub depth_mae_m: Option<f32>,
+    #[serde(default)]
+    pub depth_rmse_m: Option<f32>,
+    #[serde(default)]
+    pub delta_lt_1_25: Option<f32>,
+    #[serde(default)]
+    pub delta_lt_1_25_sq: Option<f32>,
+    pub valid_pixel_fraction: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AggregatedRangeDepthMetrics {
+    #[serde(default)]
+    pub mean_depth_mae_m: Option<f32>,
+    #[serde(default)]
+    pub mean_depth_rmse_m: Option<f32>,
+    #[serde(default)]
+    pub mean_delta_lt_1_25: Option<f32>,
+    #[serde(default)]
+    pub mean_delta_lt_1_25_sq: Option<f32>,
+    pub mean_valid_pixel_fraction: f32,
 }
 
 pub fn compute_modality_metrics(
@@ -77,6 +107,108 @@ pub fn compute_modality_metrics(
         rmse,
         psnr_db,
         ssim: None,
+    }
+}
+
+pub fn compute_range_depth_metrics(
+    predicted: &[f32],
+    ground_truth: &[f32],
+    channels: usize,
+    height: usize,
+    width: usize,
+    validity_channel: Option<usize>,
+    max_range_meters: f32,
+) -> RangeDepthMetrics {
+    assert_eq!(
+        predicted.len(),
+        ground_truth.len(),
+        "tensor lengths must match"
+    );
+    assert!(channels > 0, "channels must be positive");
+    assert!(height > 0, "height must be positive");
+    assert!(width > 0, "width must be positive");
+    assert!(max_range_meters > 0.0, "max_range_meters must be positive");
+
+    let pixels = height
+        .checked_mul(width)
+        .expect("image dimensions overflow");
+    let expected_len = channels
+        .checked_mul(pixels)
+        .expect("image dimensions overflow");
+    assert_eq!(
+        predicted.len(),
+        expected_len,
+        "tensors must be CHW with declared dimensions"
+    );
+    if let Some(channel) = validity_channel {
+        assert!(
+            channel < channels,
+            "validity channel index {channel} out of bounds for {channels} channel tensor"
+        );
+    }
+
+    let depth_truth = &ground_truth[..pixels];
+    let depth_pred = &predicted[..pixels];
+    let mask = validity_channel.map(|channel| {
+        let start = channel * pixels;
+        &ground_truth[start..start + pixels]
+    });
+    let mut valid = 0usize;
+    let mut sum_abs = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    let mut inlier_125 = 0usize;
+    let mut inlier_125_sq = 0usize;
+    let delta_125 = 1.25f32;
+    let delta_125_sq = delta_125 * delta_125;
+
+    for idx in 0..pixels {
+        let is_valid = match mask {
+            Some(mask) => mask[idx] > 0.5,
+            None => depth_truth[idx] > 0.0,
+        };
+        if !is_valid {
+            continue;
+        }
+
+        let truth_m = depth_truth[idx].clamp(0.0, 1.0) * max_range_meters;
+        if truth_m <= 0.0 {
+            continue;
+        }
+
+        let pred_m = depth_pred[idx].clamp(0.0, 1.0) * max_range_meters;
+        let diff = pred_m - truth_m;
+        sum_abs += diff.abs();
+        sum_sq += diff * diff;
+        valid += 1;
+
+        let denom = pred_m.abs().max(1e-6);
+        let ratio = (pred_m / truth_m).abs().max((truth_m / denom).abs());
+        if ratio < delta_125 {
+            inlier_125 += 1;
+        }
+        if ratio < delta_125_sq {
+            inlier_125_sq += 1;
+        }
+    }
+
+    let valid_pixel_fraction = valid as f32 / pixels.max(1) as f32;
+    if valid == 0 {
+        return RangeDepthMetrics {
+            depth_mae_m: None,
+            depth_rmse_m: None,
+            delta_lt_1_25: None,
+            delta_lt_1_25_sq: None,
+            valid_pixel_fraction,
+        };
+    }
+
+    let denom = valid as f32;
+    RangeDepthMetrics {
+        depth_mae_m: Some(sum_abs / denom),
+        depth_rmse_m: Some((sum_sq / denom).sqrt()),
+        delta_lt_1_25: Some(inlier_125 as f32 / denom),
+        delta_lt_1_25_sq: Some(inlier_125_sq as f32 / denom),
+        valid_pixel_fraction,
     }
 }
 
@@ -217,6 +349,45 @@ pub fn aggregate_metrics(samples: &[ModalityMetrics]) -> AggregatedMetrics {
     }
 }
 
+pub fn aggregate_range_depth_metrics(samples: &[RangeDepthMetrics]) -> AggregatedRangeDepthMetrics {
+    assert!(!samples.is_empty(), "samples must not be empty");
+
+    let n = samples.len() as f32;
+    let mean_valid_pixel_fraction = samples
+        .iter()
+        .map(|metrics| metrics.valid_pixel_fraction)
+        .sum::<f32>()
+        / n;
+    let depth_mae_values: Vec<_> = samples
+        .iter()
+        .filter_map(|metrics| metrics.depth_mae_m)
+        .collect();
+    let depth_rmse_values: Vec<_> = samples
+        .iter()
+        .filter_map(|metrics| metrics.depth_rmse_m)
+        .collect();
+    let delta_125_values: Vec<_> = samples
+        .iter()
+        .filter_map(|metrics| metrics.delta_lt_1_25)
+        .collect();
+    let delta_125_sq_values: Vec<_> = samples
+        .iter()
+        .filter_map(|metrics| metrics.delta_lt_1_25_sq)
+        .collect();
+
+    AggregatedRangeDepthMetrics {
+        mean_depth_mae_m: (!depth_mae_values.is_empty())
+            .then(|| depth_mae_values.iter().sum::<f32>() / depth_mae_values.len() as f32),
+        mean_depth_rmse_m: (!depth_rmse_values.is_empty())
+            .then(|| depth_rmse_values.iter().sum::<f32>() / depth_rmse_values.len() as f32),
+        mean_delta_lt_1_25: (!delta_125_values.is_empty())
+            .then(|| delta_125_values.iter().sum::<f32>() / delta_125_values.len() as f32),
+        mean_delta_lt_1_25_sq: (!delta_125_sq_values.is_empty())
+            .then(|| delta_125_sq_values.iter().sum::<f32>() / delta_125_sq_values.len() as f32),
+        mean_valid_pixel_fraction,
+    }
+}
+
 pub fn summarize_split(results: &[SampleEvalResult], split: &str) -> SplitEvalSummary {
     let rgb_metrics: Vec<_> = results
         .iter()
@@ -226,12 +397,18 @@ pub fn summarize_split(results: &[SampleEvalResult], split: &str) -> SplitEvalSu
         .iter()
         .filter_map(|result| result.range_metrics.clone())
         .collect();
+    let range_depth_metrics: Vec<_> = results
+        .iter()
+        .filter_map(|result| result.range_depth_metrics.clone())
+        .collect();
 
     SplitEvalSummary {
         split: split.to_owned(),
         n_samples: results.len(),
         rgb: (!rgb_metrics.is_empty()).then(|| aggregate_metrics(&rgb_metrics)),
         range: (!range_metrics.is_empty()).then(|| aggregate_metrics(&range_metrics)),
+        range_depth: (!range_depth_metrics.is_empty())
+            .then(|| aggregate_range_depth_metrics(&range_depth_metrics)),
     }
 }
 
@@ -250,15 +427,16 @@ pub fn write_eval_csv(results: &[SampleEvalResult], path: &Path) -> Result<()> {
 
     writeln!(
         writer,
-        "sample_id,rgb_mse,rgb_mae,rgb_rmse,rgb_psnr_db,rgb_ssim,range_mse,range_mae,range_rmse,range_psnr_db,range_ssim"
+        "sample_id,rgb_mse,rgb_mae,rgb_rmse,rgb_psnr_db,rgb_ssim,range_mse,range_mae,range_rmse,range_psnr_db,range_ssim,range_proxy_psnr_db,range_proxy_ssim,range_depth_mae_m,range_depth_rmse_m,range_delta_lt_1_25,range_delta_lt_1_25_sq,range_valid_pixel_fraction"
     )?;
 
     for result in results {
         let rgb = result.rgb_metrics.as_ref();
         let range = result.range_metrics.as_ref();
+        let range_depth = result.range_depth_metrics.as_ref();
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             escape_csv_field(&result.sample_id),
             format_optional_metric(rgb.map(|m| m.mse)),
             format_optional_metric(rgb.map(|m| m.mae)),
@@ -269,7 +447,14 @@ pub fn write_eval_csv(results: &[SampleEvalResult], path: &Path) -> Result<()> {
             format_optional_metric(range.map(|m| m.mae)),
             format_optional_metric(range.map(|m| m.rmse)),
             format_optional_metric(range.map(|m| m.psnr_db)),
-            format_optional_metric(None),
+            format_optional_metric(range.and_then(|m| m.ssim)),
+            format_optional_metric(range.map(|m| m.psnr_db)),
+            format_optional_metric(range.and_then(|m| m.ssim)),
+            format_optional_metric(range_depth.and_then(|m| m.depth_mae_m)),
+            format_optional_metric(range_depth.and_then(|m| m.depth_rmse_m)),
+            format_optional_metric(range_depth.and_then(|m| m.delta_lt_1_25)),
+            format_optional_metric(range_depth.and_then(|m| m.delta_lt_1_25_sq)),
+            format_optional_metric(range_depth.map(|m| m.valid_pixel_fraction)),
         )?;
     }
 
@@ -282,19 +467,21 @@ pub fn write_eval_markdown(summary: &SplitEvalSummary, path: &Path) -> Result<()
     markdown.push_str(&format!("# Evaluation Summary: {}\n\n", summary.split));
     markdown.push_str(&format!("- Samples: {}\n\n", summary.n_samples));
     markdown.push_str(
-        "| Modality | Mean MSE | Mean MAE | Mean RMSE | Mean PSNR (dB) | Mean SSIM | Std MSE |\n",
+        "| Modality | Mean MSE | Mean MAE | Mean RMSE | Mean Proxy PSNR (dB) | Mean Proxy SSIM | Mean Depth MAE (m) | Mean Depth RMSE (m) | Mean δ<1.25 | Mean δ<1.25² | Mean Valid Fraction | Std MSE |\n",
     );
-    markdown.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    markdown.push_str(
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
 
     if let Some(rgb) = &summary.rgb {
-        markdown.push_str(&metrics_row("RGB", rgb));
+        markdown.push_str(&metrics_row("RGB", rgb, None));
     }
     if let Some(range) = &summary.range {
-        markdown.push_str(&metrics_row("Range", range));
+        markdown.push_str(&metrics_row("Range", range, summary.range_depth.as_ref()));
     }
 
     if summary.rgb.is_none() && summary.range.is_none() {
-        markdown.push_str("| None | - | - | - | - | - | - |\n");
+        markdown.push_str("| None | - | - | - | - | - | - | - | - | - | - | - |\n");
     }
 
     fs::write(path, markdown)?;
@@ -324,19 +511,55 @@ fn escape_csv_field(value: &str) -> String {
     }
 }
 
-fn metrics_row(label: &str, metrics: &AggregatedMetrics) -> String {
+fn metrics_row(
+    label: &str,
+    metrics: &AggregatedMetrics,
+    range_depth: Option<&AggregatedRangeDepthMetrics>,
+) -> String {
     let mean_ssim = metrics.mean_ssim.map_or_else(
         || "-".to_owned(),
         |value| format_optional_metric(Some(value)),
     );
+    let depth_mae = range_depth
+        .and_then(|metrics| metrics.mean_depth_mae_m)
+        .map_or_else(
+            || "-".to_owned(),
+            |value| format_optional_metric(Some(value)),
+        );
+    let depth_rmse = range_depth
+        .and_then(|metrics| metrics.mean_depth_rmse_m)
+        .map_or_else(
+            || "-".to_owned(),
+            |value| format_optional_metric(Some(value)),
+        );
+    let delta_125 = range_depth
+        .and_then(|metrics| metrics.mean_delta_lt_1_25)
+        .map_or_else(
+            || "-".to_owned(),
+            |value| format_optional_metric(Some(value)),
+        );
+    let delta_125_sq = range_depth
+        .and_then(|metrics| metrics.mean_delta_lt_1_25_sq)
+        .map_or_else(
+            || "-".to_owned(),
+            |value| format_optional_metric(Some(value)),
+        );
+    let valid_fraction = range_depth
+        .map(|metrics| format_optional_metric(Some(metrics.mean_valid_pixel_fraction)))
+        .unwrap_or_else(|| "-".to_owned());
     format!(
-        "| {} | {:.6} | {:.6} | {:.6} | {} | {} | {:.6} |\n",
+        "| {} | {:.6} | {:.6} | {:.6} | {} | {} | {} | {} | {} | {} | {} | {:.6} |\n",
         label,
         metrics.mean_mse,
         metrics.mean_mae,
         metrics.mean_rmse,
         format_optional_metric(Some(metrics.mean_psnr_db)),
         mean_ssim,
+        depth_mae,
+        depth_rmse,
+        delta_125,
+        delta_125_sq,
+        valid_fraction,
         metrics.std_mse,
     )
 }
@@ -417,6 +640,48 @@ mod tests {
         approx_eq(metrics.mse, 2.0);
         approx_eq(metrics.rmse, metrics.mse.sqrt());
         approx_eq(metrics.rmse, 2.0_f32.sqrt());
+    }
+
+    #[test]
+    fn compute_range_depth_metrics_respects_validity_channel_and_scale() {
+        let predicted = [0.1, 0.5, 0.6, 0.2, 0.0, 0.0, 0.0, 0.0];
+        let truth = [0.2, 0.4, 0.6, 0.8, 1.0, 0.0, 1.0, 0.0];
+
+        let metrics = compute_range_depth_metrics(&predicted, &truth, 2, 1, 4, Some(1), 75.0);
+
+        approx_eq(metrics.valid_pixel_fraction, 0.5);
+        approx_eq(metrics.depth_mae_m.expect("depth_mae_m"), 3.75);
+        approx_eq(metrics.depth_rmse_m.expect("depth_rmse_m"), 5.303301);
+        approx_eq(metrics.delta_lt_1_25.expect("delta_lt_1_25"), 0.5);
+        approx_eq(metrics.delta_lt_1_25_sq.expect("delta_lt_1_25_sq"), 0.5);
+    }
+
+    #[test]
+    fn compute_range_depth_metrics_handles_empty_valid_mask() {
+        let predicted = [0.1, 0.2, 0.0, 0.0];
+        let truth = [0.2, 0.3, 0.0, 0.0];
+
+        let metrics = compute_range_depth_metrics(&predicted, &truth, 2, 1, 2, Some(1), 75.0);
+
+        approx_eq(metrics.valid_pixel_fraction, 0.0);
+        assert_eq!(metrics.depth_mae_m, None);
+        assert_eq!(metrics.depth_rmse_m, None);
+        assert_eq!(metrics.delta_lt_1_25, None);
+        assert_eq!(metrics.delta_lt_1_25_sq, None);
+    }
+
+    #[test]
+    fn compute_range_depth_metrics_falls_back_to_nonzero_truth_when_mask_missing() {
+        let predicted = [0.0, 0.1, 0.5];
+        let truth = [0.0, 0.2, 0.4];
+
+        let metrics = compute_range_depth_metrics(&predicted, &truth, 1, 1, 3, None, 75.0);
+
+        approx_eq(metrics.valid_pixel_fraction, 2.0 / 3.0);
+        approx_eq(metrics.depth_mae_m.expect("depth_mae_m"), 7.5);
+        approx_eq(metrics.depth_rmse_m.expect("depth_rmse_m"), 7.5);
+        approx_eq(metrics.delta_lt_1_25.expect("delta_lt_1_25"), 0.0);
+        approx_eq(metrics.delta_lt_1_25_sq.expect("delta_lt_1_25_sq"), 0.5);
     }
 
     #[test]
@@ -553,6 +818,7 @@ mod tests {
                     psnr_db: 12.0,
                     ssim: None,
                 }),
+                range_depth_metrics: None,
             },
             SampleEvalResult {
                 sample_id: "sample-b".to_owned(),
@@ -570,6 +836,7 @@ mod tests {
                     psnr_db: 6.0,
                     ssim: None,
                 }),
+                range_depth_metrics: None,
             },
         ];
 
@@ -593,6 +860,49 @@ mod tests {
         approx_eq(range.mean_psnr_db, 9.0);
         assert_eq!(range.mean_ssim, None);
         approx_eq(range.std_mse, 6.0);
+        assert_eq!(summary.range_depth, None);
+    }
+
+    #[test]
+    fn summarize_split_aggregates_range_depth_metrics() {
+        let results = vec![
+            SampleEvalResult {
+                sample_id: "sample-a".to_owned(),
+                rgb_metrics: None,
+                range_metrics: None,
+                range_depth_metrics: Some(RangeDepthMetrics {
+                    depth_mae_m: Some(1.0),
+                    depth_rmse_m: Some(2.0),
+                    delta_lt_1_25: Some(0.5),
+                    delta_lt_1_25_sq: Some(0.75),
+                    valid_pixel_fraction: 0.4,
+                }),
+            },
+            SampleEvalResult {
+                sample_id: "sample-b".to_owned(),
+                rgb_metrics: None,
+                range_metrics: None,
+                range_depth_metrics: Some(RangeDepthMetrics {
+                    depth_mae_m: Some(3.0),
+                    depth_rmse_m: Some(4.0),
+                    delta_lt_1_25: Some(0.25),
+                    delta_lt_1_25_sq: Some(0.5),
+                    valid_pixel_fraction: 0.8,
+                }),
+            },
+        ];
+
+        let summary = summarize_split(&results, "test");
+        let depth = summary.range_depth.expect("range depth should be present");
+
+        approx_eq(depth.mean_depth_mae_m.expect("mean_depth_mae_m"), 2.0);
+        approx_eq(depth.mean_depth_rmse_m.expect("mean_depth_rmse_m"), 3.0);
+        approx_eq(depth.mean_delta_lt_1_25.expect("mean_delta_lt_1_25"), 0.375);
+        approx_eq(
+            depth.mean_delta_lt_1_25_sq.expect("mean_delta_lt_1_25_sq"),
+            0.625,
+        );
+        approx_eq(depth.mean_valid_pixel_fraction, 0.6);
     }
 
     #[test]
@@ -614,6 +924,13 @@ mod tests {
                 psnr_db: 7.5,
                 ssim: None,
             }),
+            range_depth_metrics: Some(RangeDepthMetrics {
+                depth_mae_m: Some(0.5),
+                depth_rmse_m: Some(0.75),
+                delta_lt_1_25: Some(0.9),
+                delta_lt_1_25_sq: Some(1.0),
+                valid_pixel_fraction: 0.5,
+            }),
         }];
 
         write_eval_csv(&results, &path).expect("csv should be written");
@@ -621,9 +938,11 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert!(content.contains(
-            "sample_id,rgb_mse,rgb_mae,rgb_rmse,rgb_psnr_db,rgb_ssim,range_mse,range_mae,range_rmse,range_psnr_db,range_ssim"
+            "sample_id,rgb_mse,rgb_mae,rgb_rmse,rgb_psnr_db,rgb_ssim,range_mse,range_mae,range_rmse,range_psnr_db,range_ssim,range_proxy_psnr_db,range_proxy_ssim,range_depth_mae_m,range_depth_rmse_m,range_delta_lt_1_25,range_delta_lt_1_25_sq,range_valid_pixel_fraction"
         ));
-        assert!(content.contains("sample-1,0.25,0.5,0.5,inf,0.9876543,1.5,1.25,1.2247449,7.5,"));
+        assert!(content.contains(
+            "sample-1,0.25,0.5,0.5,inf,0.9876543,1.5,1.25,1.2247449,7.5,,7.5,,0.5,0.75,0.9,1,0.5"
+        ));
     }
 
     #[test]
@@ -641,6 +960,7 @@ mod tests {
                 std_mse: 0.25,
             }),
             range: None,
+            range_depth: None,
         };
 
         write_eval_markdown(&summary, &path).expect("markdown should be written");
@@ -650,10 +970,10 @@ mod tests {
         assert!(content.contains("# Evaluation Summary: test"));
         assert!(content.contains("- Samples: 3"));
         assert!(content.contains(
-            "| Modality | Mean MSE | Mean MAE | Mean RMSE | Mean PSNR (dB) | Mean SSIM | Std MSE |"
+            "| Modality | Mean MSE | Mean MAE | Mean RMSE | Mean Proxy PSNR (dB) | Mean Proxy SSIM | Mean Depth MAE (m) | Mean Depth RMSE (m) | Mean δ<1.25 | Mean δ<1.25² | Mean Valid Fraction | Std MSE |"
         ));
-        assert!(
-            content.contains("| RGB | 1.500000 | 0.750000 | 1.224745 | 18 | 0.875 | 0.250000 |")
-        );
+        assert!(content.contains(
+            "| RGB | 1.500000 | 0.750000 | 1.224745 | 18 | 0.875 | - | - | - | - | - | 0.250000 |"
+        ));
     }
 }

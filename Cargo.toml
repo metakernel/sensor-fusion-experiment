@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sfx-core",
     "crates/sfx-config",
+    "crates/sfx-bench",
     "crates/sfx-data",
     "crates/sfx-waymo",
     "crates/sfx-preprocess",
@@ -25,6 +26,7 @@ burn = { version = "0.21.0", default-features = false, features = ["std", "flex"
 clap = { version = "4.5", features = ["derive"] }
 sfx-data = { path = "crates/sfx-data" }
 sfx-config = { path = "crates/sfx-config" }
+sfx-bench = { path = "crates/sfx-bench" }
 sfx-core = { path = "crates/sfx-core" }
 sfx-eval = { path = "crates/sfx-eval" }
 sfx-models = { path = "crates/sfx-models" }

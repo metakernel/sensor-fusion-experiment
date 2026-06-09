@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod inference;
-pub use inference::{Reconstruction, RunInference};
+pub use inference::{Embedding, Reconstruction, RunInference};
 
 pub const CRATE_NAME: &str = "sfx-train";
 
@@ -51,6 +51,10 @@ pub struct TrainingSummary {
     pub dataset_config_path: PathBuf,
     #[serde(default)]
     pub model_config_path: PathBuf,
+    #[serde(default)]
+    pub dataset_manifest_path: PathBuf,
+    #[serde(default)]
+    pub split_protocol: String,
     pub metrics_path: PathBuf,
     pub summary_path: PathBuf,
     pub checkpoint_path: PathBuf,
@@ -59,6 +63,10 @@ pub struct TrainingSummary {
     pub epochs: usize,
     pub train_samples: usize,
     pub batch_size: usize,
+    #[serde(default)]
+    pub learning_rate: f32,
+    #[serde(default)]
+    pub seed: u64,
     #[serde(default)]
     pub max_batches_per_epoch: Option<usize>,
     pub latent_dim: usize,
@@ -126,7 +134,8 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         );
     }
 
-    let manifest_path = root.join(".xtask/manifests/processed_samples.json");
+    let manifest_path = resolve_processed_manifest_path(root, &config);
+    let split_protocol = resolve_split_protocol(&config);
     let train_dataset = FusionDataset::open_split(
         &config.dataset.processed_dir,
         &manifest_path,
@@ -263,6 +272,8 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         config_path: sfx_config::resolve_from_root(root, config_path),
         dataset_config_path: config.dataset_config_path.clone(),
         model_config_path: config.model_config_path.clone(),
+        dataset_manifest_path: manifest_path.clone(),
+        split_protocol,
         metrics_path: metrics_path.clone(),
         summary_path: run.summary_path.clone(),
         checkpoint_path: run.checkpoint_path.clone(),
@@ -270,6 +281,8 @@ pub fn train_range_autoencoder(root: &Path, config_path: &Path) -> Result<Traini
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        learning_rate: config.learning_rate,
+        seed: config.seed,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         z_modality: None,
@@ -391,7 +404,8 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         );
     }
 
-    let manifest_path = root.join(".xtask/manifests/processed_samples.json");
+    let manifest_path = resolve_processed_manifest_path(root, &config);
+    let split_protocol = resolve_split_protocol(&config);
     let train_dataset = FusionDataset::open_split(
         &config.dataset.processed_dir,
         &manifest_path,
@@ -528,6 +542,8 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         config_path: sfx_config::resolve_from_root(root, config_path),
         dataset_config_path: config.dataset_config_path.clone(),
         model_config_path: config.model_config_path.clone(),
+        dataset_manifest_path: manifest_path.clone(),
+        split_protocol,
         metrics_path: metrics_path.clone(),
         summary_path: run.summary_path.clone(),
         checkpoint_path: run.checkpoint_path.clone(),
@@ -535,6 +551,8 @@ pub fn train_rgb_autoencoder(root: &Path, config_path: &Path) -> Result<Training
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        learning_rate: config.learning_rate,
+        seed: config.seed,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         z_modality: None,
@@ -563,7 +581,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         );
     }
 
-    let manifest_path = root.join(".xtask/manifests/processed_samples.json");
+    let manifest_path = resolve_processed_manifest_path(root, &config);
+    let split_protocol = resolve_split_protocol(&config);
     let train_dataset = FusionDataset::open_split(
         &config.dataset.processed_dir,
         &manifest_path,
@@ -723,6 +742,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         config_path: sfx_config::resolve_from_root(root, config_path),
         dataset_config_path: config.dataset_config_path.clone(),
         model_config_path: config.model_config_path.clone(),
+        dataset_manifest_path: manifest_path.clone(),
+        split_protocol,
         metrics_path: metrics_path.clone(),
         summary_path: run.summary_path.clone(),
         checkpoint_path: run.checkpoint_path.clone(),
@@ -730,6 +751,8 @@ pub fn train_fusion_autoencoder(root: &Path, config_path: &Path) -> Result<Train
         epochs: config.epochs,
         train_samples: train_dataset.len(),
         batch_size: config.batch_size,
+        learning_rate: config.learning_rate,
+        seed: config.seed,
         max_batches_per_epoch: config.max_batches_per_epoch,
         latent_dim: config.model.latent_dim,
         z_modality: Some(config.model.effective_z_modality()),
@@ -764,6 +787,12 @@ pub fn inspect_resume_run(root: &Path, run_path: &Path) -> Result<ResumeReport> 
     }
     if summary.run_name.is_empty() {
         summary.run_name = summary.run_id.clone();
+    }
+    if summary.split_protocol.trim().is_empty() {
+        summary.split_protocol = "mixed".to_string();
+    }
+    if summary.dataset_manifest_path.as_os_str().is_empty() {
+        summary.dataset_manifest_path = root.join(".xtask/manifests/processed_samples.json");
     }
 
     let checkpoint_path = if summary.checkpoint_path.as_os_str().is_empty() {
@@ -803,6 +832,24 @@ pub fn inspect_resume_run(root: &Path, run_path: &Path) -> Result<ResumeReport> 
 
 fn mse_loss<B: Backend>(pred: Tensor<B, 4>, target: Tensor<B, 4>) -> Tensor<B, 1> {
     (pred - target).square().mean()
+}
+
+fn resolve_processed_manifest_path(root: &Path, config: &sfx_config::TrainingConfig) -> PathBuf {
+    config
+        .dataset
+        .processed_manifest_path
+        .as_ref()
+        .map(|path| sfx_config::resolve_from_root(root, path))
+        .unwrap_or_else(|| root.join(".xtask/manifests/processed_samples.json"))
+}
+
+fn resolve_split_protocol(config: &sfx_config::TrainingConfig) -> String {
+    let protocol = config.dataset.split_protocol.trim();
+    if protocol.is_empty() {
+        "mixed".to_string()
+    } else {
+        protocol.to_string()
+    }
 }
 
 fn prepare_run(

@@ -34,15 +34,15 @@ pub(crate) fn run(args: CompareArgs, paths: &ProjectPaths) -> Result<()> {
 
     let mut table = String::new();
     if has_eval {
-        table.push_str("| run_name | model | epochs | final_train_loss | final_val_loss | backend | eval_split | rgb_mse | rgb_psnr | rgb_ssim | range_mse | range_psnr |\n");
+        table.push_str("| run_name | model | epochs | final_train_loss | final_val_loss | backend | eval_split | rgb_mse | rgb_proxy_psnr | rgb_proxy_ssim | range_mse | range_proxy_psnr | range_depth_mae_m | range_valid_frac |\n");
         table.push_str(
-            "| --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |\n",
+            "| --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
         );
         for comparison in &comparisons {
             let summary = &comparison.training;
             let eval = comparison.eval.as_ref();
             table.push_str(&format!(
-                "| {} | {} | {} | {:.6} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {:.6} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 escape_md(&summary.run_name),
                 escape_md(&summary.model_kind),
                 summary.epochs,
@@ -77,7 +77,19 @@ pub(crate) fn run(args: CompareArgs, paths: &ProjectPaths) -> Result<()> {
                         .range
                         .as_ref()
                         .map(|metrics| metrics.mean_psnr_db)
-                }))
+                })),
+                format_optional_metric(eval.and_then(|eval| {
+                    eval.summary
+                        .range_depth
+                        .as_ref()
+                        .and_then(|metrics| metrics.mean_depth_mae_m)
+                })),
+                format_optional_metric(eval.and_then(|eval| {
+                    eval.summary
+                        .range_depth
+                        .as_ref()
+                        .map(|metrics| metrics.mean_valid_pixel_fraction)
+                })),
             ));
         }
     } else {

@@ -5,6 +5,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -15,6 +16,7 @@ const COL_SEGMENT: &str = "key.segment_context_name";
 const COL_TIMESTAMP: &str = "key.frame_timestamp_micros";
 const COL_CAMERA_NAME: &str = "key.camera_name";
 const COL_LASER_NAME: &str = "key.laser_name";
+const COL_BOX_TYPE: &str = "[CameraBoxComponent].type";
 
 #[derive(Debug, Clone)]
 pub struct SchemaField {
@@ -35,6 +37,26 @@ pub struct LidarFrame {
     pub timestamp_micros: i64,
     pub range_values: Vec<f32>,
     pub shape: [usize; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CameraBoxClassCounts {
+    pub vehicle: u32,
+    pub pedestrian: u32,
+    pub cyclist: u32,
+    pub sign: u32,
+}
+
+impl CameraBoxClassCounts {
+    fn increment_type(&mut self, class_type: i8) {
+        match class_type {
+            1 => self.vehicle += 1,
+            2 => self.pedestrian += 1,
+            3 => self.sign += 1,
+            4 => self.cyclist += 1,
+            _ => {}
+        }
+    }
 }
 
 pub fn read_schema(path: &Path) -> Result<Vec<SchemaField>> {
@@ -183,6 +205,57 @@ pub fn read_lidar_frames_for_sensor(
     }
 
     Ok(frames)
+}
+
+pub fn read_camera_box_counts_for_sensor(
+    path: &Path,
+    sensor_name: i8,
+) -> Result<BTreeMap<(String, i64), CameraBoxClassCounts>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("reading parquet metadata of {}", path.display()))?;
+
+    let schema = builder.schema().clone();
+    let type_col = find_column_containing(&schema, COL_BOX_TYPE).ok_or_else(|| {
+        anyhow!(
+            "no camera box type column found; schema:\n{}",
+            schema_summary(&schema)
+        )
+    })?;
+
+    let reader = builder.build()?;
+    let mut by_frame = BTreeMap::new();
+
+    for batch in reader {
+        let batch = batch.context("reading record batch")?;
+
+        let segments = col_as::<StringArray>(&batch, COL_SEGMENT, "StringArray")?;
+        let timestamps = col_as::<Int64Array>(&batch, COL_TIMESTAMP, "Int64Array")?;
+        let camera_names = batch
+            .column_by_name(COL_CAMERA_NAME)
+            .ok_or_else(|| anyhow!("missing column '{COL_CAMERA_NAME}'"))?;
+        let class_types = batch
+            .column_by_name(&type_col)
+            .ok_or_else(|| anyhow!("column {type_col} missing in batch"))?;
+
+        for i in 0..batch.num_rows() {
+            if sensor_name_at(camera_names.as_ref(), i)? != sensor_name {
+                continue;
+            }
+
+            let class_type = sensor_name_at(class_types.as_ref(), i)?;
+            if !matches!(class_type, 1..=4) {
+                continue;
+            }
+            let key = (segments.value(i).to_string(), timestamps.value(i));
+            by_frame
+                .entry(key)
+                .or_insert_with(CameraBoxClassCounts::default)
+                .increment_type(class_type);
+        }
+    }
+
+    Ok(by_frame)
 }
 
 fn sensor_name_at(col: &dyn Array, row: usize) -> Result<i8> {
@@ -334,4 +407,87 @@ fn schema_summary(schema: &SchemaRef) -> String {
         .map(|f| format!("  {}: {:?}", f.name(), f.data_type()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    #[test]
+    fn reads_front_camera_box_counts_per_frame() {
+        let root = temp_root("reads_front_camera_box_counts_per_frame");
+        let path = root.join("camera_box.parquet");
+        write_camera_box_fixture(&path);
+
+        let counts = read_camera_box_counts_for_sensor(&path, CAMERA_FRONT).unwrap();
+
+        let frame_100 = counts
+            .get(&(String::from("segment-a"), 100))
+            .expect("frame 100 should be present");
+        assert_eq!(frame_100.vehicle, 1);
+        assert_eq!(frame_100.pedestrian, 1);
+        assert_eq!(frame_100.cyclist, 0);
+        assert_eq!(frame_100.sign, 0);
+
+        let frame_200 = counts
+            .get(&(String::from("segment-a"), 200))
+            .expect("frame 200 should be present");
+        assert_eq!(frame_200.sign, 1);
+
+        assert!(
+            !counts.contains_key(&(String::from("segment-b"), 300)),
+            "unknown class types should not create a frame entry"
+        );
+    }
+
+    fn write_camera_box_fixture(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_SEGMENT, DataType::Utf8, false),
+            Field::new(COL_TIMESTAMP, DataType::Int64, false),
+            Field::new(COL_CAMERA_NAME, DataType::Int8, false),
+            Field::new(COL_BOX_TYPE, DataType::Int8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "segment-a",
+                    "segment-a",
+                    "segment-a",
+                    "segment-a",
+                    "segment-b",
+                ])),
+                Arc::new(Int64Array::from(vec![100, 100, 100, 200, 300])),
+                Arc::new(Int8Array::from(vec![
+                    CAMERA_FRONT,
+                    CAMERA_FRONT,
+                    2,
+                    CAMERA_FRONT,
+                    CAMERA_FRONT,
+                ])),
+                Arc::new(Int8Array::from(vec![1, 2, 4, 3, 9])),
+            ],
+        )
+        .expect("batch");
+
+        let file = std::fs::File::create(path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close parquet");
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("sfx-waymo-{name}-{}", std::process::id()));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
 }

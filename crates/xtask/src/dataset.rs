@@ -3,6 +3,7 @@ use crate::{
     DatasetPreviewArgs, DatasetSourceSplit, ProjectPaths, display_from_root,
 };
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sfx_core::manifest::{
     DownloadStatus, DownloadedFileEntry, DownloadedFileManifest, ExtractionSummaryEntry,
     ExtractionSummaryManifest, MANIFEST_SCHEMA_VERSION, ProcessedSampleManifest, RawFileEntry,
@@ -21,6 +22,139 @@ pub(crate) fn run(command: DatasetCommand, paths: &ProjectPaths) -> Result<()> {
         DatasetCommand::Inspect(args) => inspect(args, paths),
         DatasetCommand::Preview(args) => preview(args, paths),
     }
+}
+
+const LABELS_SCHEMA_VERSION: u32 = 1;
+const NORMALIZATION_SCHEMA_VERSION: u32 = 1;
+const LABEL_SOURCE_COMPONENT: &str = "camera_box";
+const CAMERA_COMPONENT: &str = "camera_image";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FrameKey {
+    segment: String,
+    timestamp_micros: i64,
+}
+
+impl FrameKey {
+    fn new(segment: String, timestamp_micros: i64) -> Self {
+        Self {
+            segment,
+            timestamp_micros,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+struct LabelClassCounts {
+    vehicle: u32,
+    pedestrian: u32,
+    cyclist: u32,
+    sign: u32,
+}
+
+impl LabelClassCounts {
+    fn from_waymo(counts: sfx_waymo::extract::CameraBoxClassCounts) -> Self {
+        Self {
+            vehicle: counts.vehicle,
+            pedestrian: counts.pedestrian,
+            cyclist: counts.cyclist,
+            sign: counts.sign,
+        }
+    }
+
+    fn presence(self) -> LabelClassPresence {
+        LabelClassPresence {
+            vehicle: u8::from(self.vehicle > 0),
+            pedestrian: u8::from(self.pedestrian > 0),
+            cyclist: u8::from(self.cyclist > 0),
+            sign: u8::from(self.sign > 0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+struct LabelClassPresence {
+    vehicle: u8,
+    pedestrian: u8,
+    cyclist: u8,
+    sign: u8,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LabelScopeMetadata {
+    source_component: String,
+    camera_name_id: i8,
+    camera_name: String,
+    label_definition: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ValidityMaskMetadata {
+    source: String,
+    resize: String,
+    threshold: String,
+    valid_pixels: usize,
+    total_pixels: usize,
+    valid_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SampleLabelsSidecar {
+    schema_version: u32,
+    sample_id: String,
+    split: Split,
+    source_segment: String,
+    timestamp_micros: i64,
+    label_scope: LabelScopeMetadata,
+    counts: LabelClassCounts,
+    presence: LabelClassPresence,
+    validity_mask: ValidityMaskMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LabelsManifest {
+    schema_version: u32,
+    dataset: Option<String>,
+    classes: Vec<String>,
+    benchmarkable_classes: Vec<String>,
+    label_scope: LabelScopeMetadata,
+    samples: Vec<LabelsManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LabelsManifestEntry {
+    sample_id: String,
+    split: Split,
+    source_segment: String,
+    timestamp_micros: i64,
+    labels_path: PathBuf,
+    counts: LabelClassCounts,
+    presence: LabelClassPresence,
+    validity_mask: ValidityMaskMetadata,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NormalizationManifest {
+    schema_version: u32,
+    dataset: Option<String>,
+    range_normalization: RangeNormalizationDetails,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RangeNormalizationDetails {
+    lidar_sensor_name_id: i8,
+    lidar_sensor_name: String,
+    max_range_meters: f32,
+    range_channel_semantics: String,
+    intensity_channel_semantics: String,
+    validity_mask_semantics: String,
+    configured_output_channels: Vec<String>,
+}
+
+struct LabelsArtifactWriteReport {
+    sample_count: usize,
+    labels_manifest_path: PathBuf,
+    normalization_path: PathBuf,
 }
 
 fn list(args: DatasetListArgs, paths: &ProjectPaths) -> Result<()> {
@@ -250,8 +384,34 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
         range_channels,
     };
 
+    if args.backfill_labels {
+        if args.inspect {
+            anyhow::bail!("--inspect and --backfill-labels cannot be combined");
+        }
+        let report = backfill_labels_artifacts(
+            paths,
+            &dataset_config.name,
+            &out_dir,
+            &process_options,
+            args.camera_name,
+            args.laser_name,
+            args.max_timestamp_delta_us,
+        )?;
+        println!(
+            "ok   {}",
+            display_from_root(&paths.root, &report.labels_manifest_path)
+        );
+        println!(
+            "ok   {}",
+            display_from_root(&paths.root, &report.normalization_path)
+        );
+        println!("labels backfilled: {}", report.sample_count);
+        return Ok(());
+    }
+
     let mut all_entries: Vec<sfx_core::manifest::ProcessedSampleEntry> = Vec::new();
     let mut extraction_entries = Vec::new();
+    let mut label_entries = Vec::new();
     let mut train_ids = Vec::new();
     let mut val_ids = Vec::new();
     let mut test_ids = Vec::new();
@@ -320,6 +480,10 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 lid_path.file_name().unwrap_or_default().to_string_lossy()
             );
 
+            let camera_box_path = camera_box_path_for_camera_file(&cam_path);
+            let camera_box_counts =
+                read_camera_box_counts_if_exists(&camera_box_path, args.camera_name)?;
+
             let camera_frames = sfx_waymo::extract::read_camera_frames_for_sensor(
                 &cam_path,
                 args.camera_name,
@@ -363,6 +527,17 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                 .map(|_| sfx_core::manifest::SampleId(format!("sample_{sample_counter:06}")));
 
             for pair in &pairs {
+                let frame_key = FrameKey::new(pair.segment.clone(), pair.timestamp_micros);
+                let counts = camera_box_counts
+                    .get(&frame_key)
+                    .copied()
+                    .unwrap_or_default();
+                let validity_mask = validity_mask_metadata_for_pair(
+                    pair,
+                    process_options.range_height,
+                    process_options.range_width,
+                )?;
+
                 let entry = sfx_preprocess::write_sample_with_options(
                     &out_dir,
                     pair,
@@ -370,8 +545,16 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
                     sample_counter,
                     &process_options,
                 )?;
+                let labels_entry = write_sample_labels_sidecar(
+                    &out_dir,
+                    &entry,
+                    LabelClassCounts::from_waymo(counts),
+                    validity_mask,
+                    args.camera_name,
+                )?;
                 let id = entry.meta.id.clone();
                 all_entries.push(entry);
+                label_entries.push(labels_entry);
                 match &split {
                     Split::Train => train_ids.push(id),
                     Split::Val => val_ids.push(id),
@@ -449,7 +632,7 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
 
     let splits_manifest = SplitsManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
-        dataset: Some(dataset_config.name),
+        dataset: Some(dataset_config.name.clone()),
         train: train_ids,
         val: val_ids,
         test: test_ids,
@@ -458,6 +641,23 @@ fn prepare(args: DatasetPrepareArgs, paths: &ProjectPaths) -> Result<()> {
     let splits_path = paths.splits_manifest_path();
     write_manifest(&splits_path, &splits_manifest)?;
     println!("ok   {}", display_from_root(&paths.root, &splits_path));
+
+    let labels_report = write_labels_and_normalization_artifacts(
+        &out_dir,
+        Some(dataset_config.name),
+        args.camera_name,
+        args.laser_name,
+        &process_options,
+        label_entries,
+    )?;
+    println!(
+        "ok   {}",
+        display_from_root(&paths.root, &labels_report.labels_manifest_path)
+    );
+    println!(
+        "ok   {}",
+        display_from_root(&paths.root, &labels_report.normalization_path)
+    );
 
     println!("total samples extracted: {sample_counter}");
     Ok(())
@@ -499,6 +699,338 @@ fn pair_component_parquet_files(
     }
 
     pairs
+}
+
+fn backfill_labels_artifacts(
+    paths: &ProjectPaths,
+    dataset_name: &str,
+    out_dir: &Path,
+    process_options: &sfx_preprocess::ProcessOptions,
+    camera_name: i8,
+    laser_name: i8,
+    max_timestamp_delta_us: i64,
+) -> Result<LabelsArtifactWriteReport> {
+    let sample_manifest_path = paths.processed_sample_manifest_path();
+    if !sample_manifest_path.exists() {
+        anyhow::bail!(
+            "processed sample manifest not found at {}\nhint: run `cargo xtask dataset prepare` first",
+            display_from_root(&paths.root, &sample_manifest_path)
+        );
+    }
+    let sample_manifest: ProcessedSampleManifest = read_manifest(&sample_manifest_path)?;
+    sample_manifest.validate()?;
+
+    let extraction_summary_path = paths.extraction_summary_manifest_path();
+    if !extraction_summary_path.exists() {
+        anyhow::bail!(
+            "extraction summary manifest not found at {}\nhint: run `cargo xtask dataset prepare` first",
+            display_from_root(&paths.root, &extraction_summary_path)
+        );
+    }
+    let extraction_summary: ExtractionSummaryManifest = read_manifest(&extraction_summary_path)?;
+    extraction_summary.validate()?;
+
+    let mut counts_by_frame = BTreeMap::new();
+    let mut validity_by_frame = BTreeMap::new();
+
+    for source in &extraction_summary.files {
+        let cam_path = resolve_manifest_path(&paths.root, &source.camera_parquet_path);
+        let lidar_path = resolve_manifest_path(&paths.root, &source.lidar_parquet_path);
+        let camera_box_path = camera_box_path_for_camera_file(&cam_path);
+
+        let camera_box_counts = read_camera_box_counts_if_exists(&camera_box_path, camera_name)?;
+        counts_by_frame.extend(camera_box_counts);
+
+        let camera_frames =
+            sfx_waymo::extract::read_camera_frames_for_sensor(&cam_path, camera_name, None)?;
+        let lidar_frames =
+            sfx_waymo::extract::read_lidar_frames_for_sensor(&lidar_path, laser_name, None)?;
+        let (pairs, _) = sfx_preprocess::align_frames_with_options(
+            camera_frames,
+            lidar_frames,
+            sfx_preprocess::AlignOptions {
+                max_timestamp_delta_micros: max_timestamp_delta_us.max(0),
+            },
+        );
+        for pair in pairs {
+            let key = FrameKey::new(pair.segment.clone(), pair.timestamp_micros);
+            let validity = validity_mask_metadata_for_pair(
+                &pair,
+                process_options.range_height,
+                process_options.range_width,
+            )?;
+            validity_by_frame.insert(key, validity);
+        }
+    }
+
+    let mut labels_entries = Vec::with_capacity(sample_manifest.samples.len());
+    for sample in &sample_manifest.samples {
+        let frame_key = FrameKey::new(
+            sample.meta.source_segment.clone(),
+            sample.meta.timestamp_micros,
+        );
+        let counts = counts_by_frame
+            .get(&frame_key)
+            .copied()
+            .map(LabelClassCounts::from_waymo)
+            .unwrap_or_default();
+        let validity_mask = validity_by_frame
+            .get(&frame_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                missing_validity_mask_metadata(
+                    process_options.range_height * process_options.range_width,
+                )
+            });
+        labels_entries.push(write_sample_labels_sidecar(
+            out_dir,
+            sample,
+            counts,
+            validity_mask,
+            camera_name,
+        )?);
+    }
+
+    write_labels_and_normalization_artifacts(
+        out_dir,
+        Some(dataset_name.to_string()),
+        camera_name,
+        laser_name,
+        process_options,
+        labels_entries,
+    )
+}
+
+fn resolve_manifest_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn camera_box_path_for_camera_file(camera_path: &Path) -> PathBuf {
+    let Some(file_name) = camera_path.file_name() else {
+        return camera_path.to_path_buf();
+    };
+    let Some(component_dir) = camera_path.parent() else {
+        return camera_path.to_path_buf();
+    };
+    let component = component_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if component.eq_ignore_ascii_case(CAMERA_COMPONENT) {
+        component_dir
+            .with_file_name(LABEL_SOURCE_COMPONENT)
+            .join(file_name)
+    } else {
+        camera_path.to_path_buf()
+    }
+}
+
+fn read_camera_box_counts_if_exists(
+    camera_box_path: &Path,
+    camera_name: i8,
+) -> Result<BTreeMap<FrameKey, sfx_waymo::extract::CameraBoxClassCounts>> {
+    if !camera_box_path.exists() {
+        println!(
+            "warn camera_box parquet missing for {}; labels will default to zeros",
+            camera_box_path.display()
+        );
+        return Ok(BTreeMap::new());
+    }
+
+    let raw_counts =
+        sfx_waymo::extract::read_camera_box_counts_for_sensor(camera_box_path, camera_name)?;
+    Ok(raw_counts
+        .into_iter()
+        .map(|((segment, timestamp), counts)| (FrameKey::new(segment, timestamp), counts))
+        .collect())
+}
+
+fn validity_mask_metadata_for_pair(
+    pair: &sfx_preprocess::ExtractedPair,
+    range_height: usize,
+    range_width: usize,
+) -> Result<ValidityMaskMetadata> {
+    let stats = sfx_preprocess::validity_mask_stats_from_raw_range(
+        &pair.range_values,
+        &pair.range_shape,
+        range_height,
+        range_width,
+    )?;
+    Ok(ValidityMaskMetadata {
+        source: "raw_range > 0".to_string(),
+        resize: "nearest-neighbor".to_string(),
+        threshold: "strictly greater than 0".to_string(),
+        valid_pixels: stats.valid_pixels,
+        total_pixels: stats.total_pixels,
+        valid_fraction: stats.valid_fraction() as f64,
+    })
+}
+
+fn missing_validity_mask_metadata(total_pixels: usize) -> ValidityMaskMetadata {
+    ValidityMaskMetadata {
+        source: "raw_range > 0".to_string(),
+        resize: "nearest-neighbor".to_string(),
+        threshold: "strictly greater than 0".to_string(),
+        valid_pixels: 0,
+        total_pixels,
+        valid_fraction: 0.0,
+    }
+}
+
+fn write_sample_labels_sidecar(
+    out_dir: &Path,
+    sample: &sfx_core::manifest::ProcessedSampleEntry,
+    counts: LabelClassCounts,
+    validity_mask: ValidityMaskMetadata,
+    camera_name: i8,
+) -> Result<LabelsManifestEntry> {
+    let labels_path = sample
+        .meta_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join("labels.json");
+    let labels_abs_path = out_dir.join(&labels_path);
+    if let Some(parent) = labels_abs_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let sidecar = SampleLabelsSidecar {
+        schema_version: LABELS_SCHEMA_VERSION,
+        sample_id: sample.meta.id.0.clone(),
+        split: sample.meta.split.clone(),
+        source_segment: sample.meta.source_segment.clone(),
+        timestamp_micros: sample.meta.timestamp_micros,
+        label_scope: label_scope_metadata(camera_name),
+        counts,
+        presence: counts.presence(),
+        validity_mask: validity_mask.clone(),
+    };
+    write_json_file(&labels_abs_path, &sidecar)?;
+
+    Ok(LabelsManifestEntry {
+        sample_id: sample.meta.id.0.clone(),
+        split: sample.meta.split.clone(),
+        source_segment: sample.meta.source_segment.clone(),
+        timestamp_micros: sample.meta.timestamp_micros,
+        labels_path,
+        counts,
+        presence: counts.presence(),
+        validity_mask,
+    })
+}
+
+fn write_labels_and_normalization_artifacts(
+    out_dir: &Path,
+    dataset_name: Option<String>,
+    camera_name: i8,
+    laser_name: i8,
+    process_options: &sfx_preprocess::ProcessOptions,
+    mut samples: Vec<LabelsManifestEntry>,
+) -> Result<LabelsArtifactWriteReport> {
+    samples.sort_by(|left, right| left.sample_id.cmp(&right.sample_id));
+
+    let labels_manifest = LabelsManifest {
+        schema_version: LABELS_SCHEMA_VERSION,
+        dataset: dataset_name.clone(),
+        classes: vec![
+            "vehicle".to_string(),
+            "pedestrian".to_string(),
+            "cyclist".to_string(),
+            "sign".to_string(),
+        ],
+        benchmarkable_classes: vec!["vehicle".to_string(), "pedestrian".to_string()],
+        label_scope: label_scope_metadata(camera_name),
+        samples,
+    };
+    let labels_manifest_path = out_dir.join("labels_manifest.json");
+    write_json_file(&labels_manifest_path, &labels_manifest)?;
+
+    let normalization = NormalizationManifest {
+        schema_version: NORMALIZATION_SCHEMA_VERSION,
+        dataset: dataset_name,
+        range_normalization: RangeNormalizationDetails {
+            lidar_sensor_name_id: laser_name,
+            lidar_sensor_name: laser_name_label(laser_name),
+            max_range_meters: sfx_preprocess::MAX_RANGE_METERS,
+            range_channel_semantics: format!(
+                "raw LASER_TOP range channel (index 0) is bilinearly resized to {}x{} then normalized by max_range_meters and clamped to [0,1]",
+                process_options.range_height, process_options.range_width
+            ),
+            intensity_channel_semantics: format!(
+                "raw LASER_TOP intensity channel (index 1) is bilinearly resized to {}x{} then divided by per-frame max intensity and clamped to [0,1]",
+                process_options.range_height, process_options.range_width
+            ),
+            validity_mask_semantics: format!(
+                "validity mask is derived from raw range > 0 before normalization, resized to {}x{} with nearest-neighbor (not bilinear-derived)",
+                process_options.range_height, process_options.range_width
+            ),
+            configured_output_channels: process_options
+                .range_channels
+                .iter()
+                .map(range_channel_name)
+                .map(ToString::to_string)
+                .collect(),
+        },
+    };
+    let normalization_path = out_dir.join("normalization.json");
+    write_json_file(&normalization_path, &normalization)?;
+
+    Ok(LabelsArtifactWriteReport {
+        sample_count: labels_manifest.samples.len(),
+        labels_manifest_path,
+        normalization_path,
+    })
+}
+
+fn label_scope_metadata(camera_name: i8) -> LabelScopeMetadata {
+    LabelScopeMetadata {
+        source_component: LABEL_SOURCE_COMPONENT.to_string(),
+        camera_name_id: camera_name,
+        camera_name: camera_name_label(camera_name),
+        label_definition:
+            "counts from Waymo camera_box with class map {1:vehicle,2:pedestrian,3:sign,4:cyclist}"
+                .to_string(),
+    }
+}
+
+fn camera_name_label(camera_name: i8) -> String {
+    if camera_name == sfx_waymo::extract::CAMERA_FRONT {
+        "CAMERA_FRONT".to_string()
+    } else {
+        format!("CAMERA_{camera_name}")
+    }
+}
+
+fn laser_name_label(laser_name: i8) -> String {
+    if laser_name == sfx_waymo::extract::LASER_TOP {
+        "LASER_TOP".to_string()
+    } else {
+        format!("LASER_{laser_name}")
+    }
+}
+
+fn range_channel_name(channel: &sfx_preprocess::RangeChannel) -> &'static str {
+    match channel {
+        sfx_preprocess::RangeChannel::Range => "range",
+        sfx_preprocess::RangeChannel::Intensity => "intensity",
+        sfx_preprocess::RangeChannel::ValidityMask => "validity",
+    }
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(value)
+        .with_context(|| format!("serializing {}", path.display()))?;
+    std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
 }
 
 fn discovery_config(args: &DatasetListArgs, waymo: sfx_config::WaymoConfig) -> DiscoveryConfig {
@@ -1468,6 +2000,7 @@ fn preview(args: DatasetPreviewArgs, paths: &ProjectPaths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn select_raw_files_respects_requested_splits_and_counts() {
@@ -1625,6 +2158,137 @@ mod tests {
         assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
     }
 
+    #[test]
+    fn labels_join_counts_by_segment_and_timestamp() {
+        let root = temp_root("labels_join_counts_by_segment_and_timestamp");
+        let processed = root.join("data\\processed\\waymo");
+        let first = fixture_sample(&processed, "sample_000000", Split::Train, "segment-a", 100);
+        let second = fixture_sample(&processed, "sample_000001", Split::Train, "segment-a", 200);
+
+        let mut counts_by_frame = BTreeMap::new();
+        counts_by_frame.insert(
+            FrameKey::new("segment-a".to_string(), 100),
+            sfx_waymo::extract::CameraBoxClassCounts {
+                vehicle: 3,
+                pedestrian: 1,
+                cyclist: 0,
+                sign: 0,
+            },
+        );
+        let validity = ValidityMaskMetadata {
+            source: "raw_range > 0".to_string(),
+            resize: "nearest-neighbor".to_string(),
+            threshold: "strictly greater than 0".to_string(),
+            valid_pixels: 4,
+            total_pixels: 8,
+            valid_fraction: 0.5,
+        };
+
+        let first_counts = counts_by_frame
+            .get(&FrameKey::new(
+                first.meta.source_segment.clone(),
+                first.meta.timestamp_micros,
+            ))
+            .copied()
+            .map(LabelClassCounts::from_waymo)
+            .unwrap_or_default();
+        let second_counts = counts_by_frame
+            .get(&FrameKey::new(
+                second.meta.source_segment.clone(),
+                second.meta.timestamp_micros,
+            ))
+            .copied()
+            .map(LabelClassCounts::from_waymo)
+            .unwrap_or_default();
+
+        let first_entry = write_sample_labels_sidecar(
+            &processed,
+            &first,
+            first_counts,
+            validity.clone(),
+            sfx_waymo::extract::CAMERA_FRONT,
+        )
+        .unwrap();
+        let second_entry = write_sample_labels_sidecar(
+            &processed,
+            &second,
+            second_counts,
+            validity.clone(),
+            sfx_waymo::extract::CAMERA_FRONT,
+        )
+        .unwrap();
+
+        let first_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(processed.join(first_entry.labels_path)).unwrap(),
+        )
+        .unwrap();
+        let second_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(processed.join(second_entry.labels_path)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(first_json["counts"]["vehicle"], 3);
+        assert_eq!(first_json["presence"]["vehicle"], 1);
+        assert_eq!(second_json["counts"]["vehicle"], 0);
+        assert_eq!(second_json["presence"]["vehicle"], 0);
+    }
+
+    #[test]
+    fn writing_labels_artifacts_does_not_rewrite_tensor_files() {
+        let root = temp_root("writing_labels_artifacts_does_not_rewrite_tensor_files");
+        let processed = root.join("data\\processed\\waymo");
+        let sample = fixture_sample(&processed, "sample_000000", Split::Train, "segment-a", 100);
+        let rgb_path = processed.join(&sample.meta.rgb_path);
+        let range_path = processed.join(&sample.meta.range_path);
+        std::fs::write(&rgb_path, [1u8, 2, 3, 4]).unwrap();
+        std::fs::write(&range_path, [9u8, 8, 7, 6]).unwrap();
+        let rgb_before = std::fs::read(&rgb_path).unwrap();
+        let range_before = std::fs::read(&range_path).unwrap();
+
+        let entry = write_sample_labels_sidecar(
+            &processed,
+            &sample,
+            LabelClassCounts {
+                vehicle: 1,
+                pedestrian: 0,
+                cyclist: 0,
+                sign: 0,
+            },
+            ValidityMaskMetadata {
+                source: "raw_range > 0".to_string(),
+                resize: "nearest-neighbor".to_string(),
+                threshold: "strictly greater than 0".to_string(),
+                valid_pixels: 4,
+                total_pixels: 8,
+                valid_fraction: 0.5,
+            },
+            sfx_waymo::extract::CAMERA_FRONT,
+        )
+        .unwrap();
+        let report = write_labels_and_normalization_artifacts(
+            &processed,
+            Some("waymo-test".to_string()),
+            sfx_waymo::extract::CAMERA_FRONT,
+            sfx_waymo::extract::LASER_TOP,
+            &sfx_preprocess::ProcessOptions::default(),
+            vec![entry],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&rgb_path).unwrap(), rgb_before);
+        assert_eq!(std::fs::read(&range_path).unwrap(), range_before);
+        assert!(report.labels_manifest_path.is_file());
+        assert!(report.normalization_path.is_file());
+
+        let normalization: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(report.normalization_path).unwrap())
+                .unwrap();
+        assert_eq!(
+            normalization["range_normalization"]["max_range_meters"],
+            75.0
+        );
+    }
+
     fn fetch_args(splits: Vec<DatasetSourceSplit>) -> DatasetFetchArgs {
         DatasetFetchArgs {
             dataset: "waymo".to_string(),
@@ -1666,5 +2330,36 @@ mod tests {
     fn write_f32_file(path: &Path, values: &[f32]) {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn fixture_sample(
+        processed_root: &Path,
+        sample_id: &str,
+        split: Split,
+        segment: &str,
+        timestamp: i64,
+    ) -> sfx_core::manifest::ProcessedSampleEntry {
+        let split_dir = match split {
+            Split::Train => "train",
+            Split::Val => "val",
+            Split::Test => "test",
+        };
+        let sample_rel = PathBuf::from(split_dir).join(sample_id);
+        let sample_dir = processed_root.join(&sample_rel);
+        std::fs::create_dir_all(&sample_dir).unwrap();
+        std::fs::write(sample_dir.join("meta.json"), "{}\n").unwrap();
+        sfx_core::manifest::ProcessedSampleEntry {
+            meta: sfx_core::manifest::MultimodalSampleMeta {
+                id: sfx_core::manifest::SampleId(sample_id.to_string()),
+                split,
+                rgb_path: sample_rel.join("rgb.f32.bin"),
+                range_path: sample_rel.join("range.f32.bin"),
+                timestamp_micros: timestamp,
+                source_segment: segment.to_string(),
+            },
+            meta_path: sample_rel.join("meta.json"),
+            preview_rgb_path: None,
+            preview_range_path: None,
+        }
     }
 }

@@ -1,3 +1,4 @@
+mod bench;
 mod compare;
 mod dataset;
 mod eval;
@@ -37,6 +38,7 @@ enum Command {
     Train(TrainArgs),
     Eval(EvalArgs),
     Compare(CompareArgs),
+    Bench(BenchArgs),
     Export(ExportArgs),
     Report(ReportArgs),
     Tui(TuiArgs),
@@ -137,6 +139,9 @@ pub(crate) struct DatasetPrepareArgs {
     pub(crate) laser_name: i8,
     #[arg(long, default_value_t = 0)]
     pub(crate) max_timestamp_delta_us: i64,
+    /// Backfill labels/metadata sidecars for an existing processed dataset without rewriting tensors.
+    #[arg(long)]
+    pub(crate) backfill_labels: bool,
     #[arg(long)]
     pub(crate) inspect: bool,
 }
@@ -189,6 +194,14 @@ pub(crate) struct EvalArgs {
 pub(crate) struct CompareArgs {
     #[arg(long, value_delimiter = ',')]
     pub(crate) runs: Vec<PathBuf>,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BenchArgs {
+    #[arg(long, default_value = "configs/bench.toml")]
+    pub(crate) config: PathBuf,
     #[arg(long)]
     pub(crate) out: Option<PathBuf>,
 }
@@ -294,6 +307,7 @@ fn main() -> Result<()> {
         Command::Train(args) => train::run(args, &paths),
         Command::Eval(args) => eval::run(args, &paths),
         Command::Compare(args) => compare::run(args, &paths),
+        Command::Bench(args) => bench::run(args, &paths),
         Command::Export(args) => export::run(args, &paths),
         Command::Report(args) => report::run(args, &paths),
         Command::Tui(args) => tui::run(args, &paths),
@@ -506,6 +520,10 @@ fn validate_configs(paths: &ProjectPaths) -> usize {
     errors += check_config("configs/dataset.waymo.small.toml", || {
         sfx_config::load_dataset_config(root, "configs/dataset.waymo.small.toml").map(|_| ())
     });
+    errors += check_config("configs/dataset.waymo.small.holdout.toml", || {
+        sfx_config::load_dataset_config(root, "configs/dataset.waymo.small.holdout.toml")
+            .map(|_| ())
+    });
     errors += check_config("configs/model.range-only.tiny.toml", || {
         sfx_config::load_model_config(root, "configs/model.range-only.tiny.toml").map(|_| ())
     });
@@ -527,11 +545,23 @@ fn validate_configs(paths: &ProjectPaths) -> usize {
     errors += check_config("configs/train.debug.toml", || {
         sfx_config::load_training_config(root, "configs/train.debug.toml").map(|_| ())
     });
+    errors += check_config("configs/train.range-only.holdout.toml", || {
+        sfx_config::load_training_config(root, "configs/train.range-only.holdout.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.rgb-only.holdout.toml", || {
+        sfx_config::load_training_config(root, "configs/train.rgb-only.holdout.toml").map(|_| ())
+    });
+    errors += check_config("configs/train.fusion.holdout.toml", || {
+        sfx_config::load_training_config(root, "configs/train.fusion.holdout.toml").map(|_| ())
+    });
     errors += check_config("configs/train.nextai.toml", || {
         sfx_config::load_training_config(root, "configs/train.nextai.toml").map(|_| ())
     });
     errors += check_config("configs/eval.default.toml", || {
         sfx_config::load_evaluation_config(root, "configs/eval.default.toml").map(|_| ())
+    });
+    errors += check_config("configs/bench.toml", || {
+        sfx_bench::load_bench_config(root, "configs/bench.toml").map(|_| ())
     });
 
     errors
@@ -559,9 +589,10 @@ fn validate_manifests(paths: &ProjectPaths) -> usize {
     errors
 }
 
-fn check_config<F>(relative: &str, validate: F) -> usize
+fn check_config<F, E>(relative: &str, validate: F) -> usize
 where
-    F: FnOnce() -> sfx_config::Result<()>,
+    F: FnOnce() -> std::result::Result<(), E>,
+    E: std::fmt::Display,
 {
     match validate() {
         Ok(()) => {

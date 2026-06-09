@@ -11,13 +11,29 @@ pub const RANGE_H: usize = 64;
 pub const RANGE_W: usize = 256;
 pub const RANGE_CHANNELS: usize = 2;
 /// Physical max range in metres used for normalisation.
-const MAX_RANGE_METERS: f32 = 75.0;
+pub const MAX_RANGE_METERS: f32 = 75.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeChannel {
     Range,
     Intensity,
     ValidityMask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidityMaskStats {
+    pub valid_pixels: usize,
+    pub total_pixels: usize,
+}
+
+impl ValidityMaskStats {
+    pub fn valid_fraction(self) -> f32 {
+        if self.total_pixels == 0 {
+            0.0
+        } else {
+            self.valid_pixels as f32 / self.total_pixels as f32
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,10 +384,12 @@ fn process_range(
         }
     }
 
-    let validity: Vec<f32> = range
+    let validity = channels
         .iter()
-        .map(|value| if *value > 0.0 { 1.0 } else { 0.0 })
-        .collect();
+        .any(|channel| matches!(channel, RangeChannel::ValidityMask))
+        .then(|| validity_mask_from_raw_range(values, shape, h, w))
+        .transpose()?
+        .unwrap_or_default();
 
     let mut chw = Vec::with_capacity(channels.len() * h * w);
     for channel in channels {
@@ -383,6 +401,51 @@ fn process_range(
     }
 
     Ok(chw)
+}
+
+pub fn validity_mask_from_raw_range(
+    values: &[f32],
+    shape: &[usize; 3],
+    h: usize,
+    w: usize,
+) -> Result<Vec<f32>> {
+    let [h_src, w_src, c_src] = *shape;
+    if h_src == 0 || w_src == 0 || c_src == 0 || h == 0 || w == 0 {
+        anyhow::bail!("invalid range shape {h_src}×{w_src}×{c_src}");
+    }
+
+    let scale_x = w_src as f32 / w as f32;
+    let scale_y = h_src as f32 / h as f32;
+    let mut validity = vec![0.0f32; h * w];
+
+    for row in 0..h {
+        let src_y = (row as f32 + 0.5) * scale_y - 0.5;
+        let yn = (src_y.round() as isize).clamp(0, h_src as isize - 1) as usize;
+
+        for col in 0..w {
+            let src_x = (col as f32 + 0.5) * scale_x - 0.5;
+            let xn = (src_x.round() as isize).clamp(0, w_src as isize - 1) as usize;
+            let idx = (yn * w_src + xn) * c_src;
+            let raw_range = values.get(idx).copied().unwrap_or(0.0);
+            validity[row * w + col] = if raw_range > 0.0 { 1.0 } else { 0.0 };
+        }
+    }
+
+    Ok(validity)
+}
+
+pub fn validity_mask_stats_from_raw_range(
+    values: &[f32],
+    shape: &[usize; 3],
+    h: usize,
+    w: usize,
+) -> Result<ValidityMaskStats> {
+    let validity = validity_mask_from_raw_range(values, shape, h, w)?;
+    let valid_pixels = validity.iter().filter(|value| **value > 0.0).count();
+    Ok(ValidityMaskStats {
+        valid_pixels,
+        total_pixels: validity.len(),
+    })
 }
 
 /// Save the processed CHW RGB tensor (already f32 [0,1]) as a PNG preview.
@@ -497,6 +560,24 @@ mod tests {
         assert!(chw[0] > 0.0);
         assert_eq!(chw[4], 1.0);
         assert_eq!(chw[6], 0.0);
+    }
+
+    #[test]
+    fn validity_mask_uses_nearest_neighbor_from_raw_range() {
+        let values = vec![
+            0.0, 0.0, // left pixel
+            10.0, 1.0, // right pixel
+        ];
+        let shape = [1, 2, 2];
+
+        let validity = validity_mask_from_raw_range(&values, &shape, 1, 4).unwrap();
+
+        assert_eq!(validity, vec![0.0, 0.0, 1.0, 1.0]);
+
+        let stats = validity_mask_stats_from_raw_range(&values, &shape, 1, 4).unwrap();
+        assert_eq!(stats.valid_pixels, 2);
+        assert_eq!(stats.total_pixels, 4);
+        assert!((stats.valid_fraction() - 0.5).abs() < f32::EPSILON);
     }
 
     fn camera(segment: &str, timestamp_micros: i64) -> CameraFrame {

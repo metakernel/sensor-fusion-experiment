@@ -8,8 +8,8 @@ range_channels = ["range", "intensity"]
 train_ratio = 0.8
 val_ratio = 0.1
 test_ratio = 0.1
-processed_manifest_path = ".xtask/manifests/processed_samples.json"
-split_protocol = "mixed"
+processed_manifest_path = ".xtask/manifests/processed_samples.segment_holdout.json"
+split_protocol = "segment-holdout"
 
 [waymo]
 bucket = "waymo_open_dataset_v_2_0_1"

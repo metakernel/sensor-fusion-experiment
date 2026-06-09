@@ -88,7 +88,7 @@ Each run creates a directory under `artifacts/checkpoints/<model-kind>/<run-id>/
 cargo xtask eval --run artifacts/checkpoints/fusion/<run-id> --split all
 ```
 
-Evaluation loads the run's `model.bin`, runs checkpoint-backed inference over the selected split (`all`, `train`, `val`, or `test`), prints a metric table, and writes `<run_dir>/eval/<split>.{json,csv,md}`. Metrics include MSE, MAE, RMSE, PSNR, and SSIM for RGB reconstructions.
+Evaluation loads the run's `model.bin`, runs checkpoint-backed inference over the selected split (`all`, `train`, `val`, or `test`), prints a metric table, and writes `<run_dir>/eval/<split>.{json,csv,md}`. Outputs include normalized proxy metrics (MSE/MAE/RMSE/PSNR/SSIM) plus physical depth reconstruction metrics for range (`depth_mae_m`, `depth_rmse_m`, `delta<1.25`, `delta<1.25^2`, and valid-pixel fraction).
 
 ### 9. Compare runs
 
@@ -96,7 +96,7 @@ Evaluation loads the run's `model.bin`, runs checkpoint-backed inference over th
 cargo xtask compare --runs artifacts/checkpoints/range/<run-a>,artifacts/checkpoints/fusion/<run-b> --out artifacts/reports/compare.md
 ```
 
-Comparison prints a Markdown table of run summaries and optionally writes it with `--out`. When `<run_dir>/eval/*.json` exists, the table appends evaluation columns for the detected split, including RGB MSE/PSNR/SSIM and range MSE/PSNR.
+Comparison prints a Markdown table of run summaries and optionally writes it with `--out`. When `<run_dir>/eval/*.json` exists, the table appends evaluation columns for the detected split, including RGB and range proxy metrics plus range physical-depth metrics when available.
 
 ### 10. Export visualizations
 
@@ -135,11 +135,13 @@ See `docs/architecture.md` for the high-level crate map.
 
 Configuration lives in `configs/`:
 
-- `dataset.waymo.small.toml`: dataset name, raw/processed directories, tensor sizes, range channels, and split ratios
+- `dataset.waymo.small.toml`: default mixed protocol dataset profile (raw/processed dirs, tensor sizes, split ratios, and `.xtask/manifests/processed_samples.json`)
+- `dataset.waymo.small.holdout.toml`: segment-disjoint holdout profile wired to `.xtask/manifests/processed_samples.segment_holdout.json`
 - `model.range-only.tiny.toml`: tiny range autoencoder shape (`kind = "range-only"`, `latent_dim = 128`)
 - `model.rgb-only.tiny.toml`: tiny RGB autoencoder shape (`kind = "rgb-only"`, `latent_dim = 128`)
 - `model.fusion.tiny.toml`: tiny fusion model shape (`kind = "fusion"`, `latent_dim = 128`, `z_modality = 256`)
-- `train.range-only.toml`, `train.rgb-only.toml`, `train.fusion.toml`: baseline training entry points
+- `train.range-only.toml`, `train.rgb-only.toml`, `train.fusion.toml`: baseline mixed-protocol training entry points
+- `train.range-only.holdout.toml`, `train.rgb-only.holdout.toml`, `train.fusion.holdout.toml`: segment-holdout retraining entry points
 - `train.debug.toml`: small fusion debug profile for fast smoke runs
 - `train.nextai.toml`: additional training profile kept alongside the main presets
 - `eval.default.toml`: evaluation configuration scaffold kept in the workspace for evaluation workflows
@@ -155,9 +157,11 @@ Local state is intentionally outside version control.
 - `.xtask/gcloud/`: local auth state and cached credentials
 - `.xtask/manifests/raw_files.json`: discovered Waymo objects from `dataset list`
 - `.xtask/manifests/downloaded_files.json`: downloaded raw parquet inventory
-- `.xtask/manifests/processed_samples.json`: processed tensor sample catalog
+- `.xtask/manifests/processed_samples.json`: mixed-protocol processed tensor sample catalog
+- `.xtask/manifests/processed_samples.segment_holdout.json`: segment-holdout processed tensor sample catalog
 - `.xtask/manifests/extraction_summary.json`: extraction/preparation summary
-- `.xtask/manifests/splits.json`: processed split assignments
+- `.xtask/manifests/splits.json`: mixed sample-level split assignments
+- `.xtask/manifests/splits.segment_holdout.json`: holdout sample-level split assignments
 - `.xtask/runs/run_index.json`: run history and statuses
 - `.xtask/runs/latest.json`: pointer to the latest completed run
 
@@ -165,6 +169,9 @@ Local state is intentionally outside version control.
 
 - `data/raw/waymo/training`, `validation`, `testing`: downloaded Waymo parquet files
 - `data/processed/waymo-range-rgb-v1/train`, `val`, `test`: processed tensor dataset produced by `dataset prepare`
+  - per-sample `labels.json` sidecars (camera-front class counts/presence + validity-mask metadata)
+  - root-level `labels_manifest.json` for efficient label lookup
+  - root-level `normalization.json` documenting range/intensity/validity normalization semantics
 - `data/samples/`: local sample artifacts used by preparation utilities
 
 ### `artifacts/`

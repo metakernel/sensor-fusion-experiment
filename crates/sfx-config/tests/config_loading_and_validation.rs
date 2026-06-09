@@ -69,7 +69,8 @@ fn training_config_loads_and_resolves_paths() {
     let root = temp_root("training_config_loads_and_resolves_paths");
     write_configs(&root, "0.34", "0.33", "0.33");
 
-    let cfg = load_training_config(&root, "configs/train.toml").expect("training config should load");
+    let cfg =
+        load_training_config(&root, "configs/train.toml").expect("training config should load");
 
     assert_eq!(cfg.run_name, "integration");
     assert_eq!(cfg.batch_size, 2);
@@ -88,10 +89,14 @@ fn dataset_validation_reports_invalid_split_sum() {
     let root = temp_root("dataset_validation_reports_invalid_split_sum");
     write_configs(&root, "0.80", "0.20", "0.20");
 
-    let err = load_dataset_config(&root, "configs/dataset.toml").expect_err("dataset must be invalid");
+    let err =
+        load_dataset_config(&root, "configs/dataset.toml").expect_err("dataset must be invalid");
     match err {
         ConfigError::Invalid { message, .. } => {
-            assert!(message.contains("split ratios"), "unexpected message: {message}");
+            assert!(
+                message.contains("split ratios"),
+                "unexpected message: {message}"
+            );
         }
         other => panic!("expected invalid config error, got {other:?}"),
     }
@@ -112,7 +117,8 @@ preview_count = 8
     )
     .unwrap();
 
-    let err = load_evaluation_config(&root, "configs/eval.toml").expect_err("split must be rejected");
+    let err =
+        load_evaluation_config(&root, "configs/eval.toml").expect_err("split must be rejected");
     match err {
         ConfigError::Invalid { message, .. } => {
             assert!(

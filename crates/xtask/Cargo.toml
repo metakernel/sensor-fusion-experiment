@@ -12,6 +12,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 serde = { workspace = true }
 serde_json = { workspace = true }
 sfx-config = { workspace = true }
+sfx-bench = { workspace = true }
 sfx-core = { workspace = true }
 sfx-data = { workspace = true }
 sfx-eval = { workspace = true }
