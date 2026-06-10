@@ -38,8 +38,8 @@ pub use ffmpeg::{
 };
 pub use latent_accounting::{
     Int8QuantizationMetadata, LatentAccountingError, QuantizationMinMaxPolicy,
-    compute_int8_quantization_metadata, dequantize_latent_from_int8,
-    deflate_compressed_size, deflate_compressed_size_for_serialized_quantized_payload,
+    compute_int8_quantization_metadata, deflate_compressed_size,
+    deflate_compressed_size_for_serialized_quantized_payload, dequantize_latent_from_int8,
     quantize_latent_to_int8, raw_f32_latent_byte_size, serialize_quantized_latent_payload,
 };
 pub use probe::{

@@ -1,21 +1,21 @@
 use crate::{CompressBenchArgs, ProjectPaths, display_from_root, resolve_run_dir};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use sfx_bench::{
-    compute_int8_quantization_metadata, deflate_compressed_size_for_serialized_quantized_payload,
-    dequantize_latent_from_int8, interpolate_rate_at_psnr, load_compression_bench_config,
-    quantize_latent_to_int8, raw_f32_latent_byte_size, render_summary_tables_markdown,
     AeOperatingPoint, AeOperatingPoints, CodecMatchedQualityPoint, CodecRdCurve, CodecRdPoint,
     CombinedSummary, CompressionBenchConfig, CompressionBenchmarkResult, CompressionMetadata,
     CompressionMode, DecodeRequest, EncodeRequest, EncodingMode, FfmpegExecutor,
     MatchedQualityPoint, MatchedQualitySummary, ModalitySummary, QuantizationConfig,
     QuantizationMinMaxPolicy, QuantizationStrategy, RdPoint, SystemFfmpegRunner, VideoCodec,
+    compute_int8_quantization_metadata, deflate_compressed_size_for_serialized_quantized_payload,
+    dequantize_latent_from_int8, interpolate_rate_at_psnr, load_compression_bench_config,
+    quantize_latent_to_int8, raw_f32_latent_byte_size, render_summary_tables_markdown,
 };
-use sfx_core::manifest::{read_manifest, ProcessedSampleManifest, Split, TensorShape};
+use sfx_core::manifest::{ProcessedSampleManifest, Split, TensorShape, read_manifest};
 use sfx_data::{BatchOptions, FusionDataset};
 use sfx_eval::{
-    aggregate_metrics, aggregate_range_depth_metrics, compute_modality_metrics,
-    compute_range_depth_metrics, compute_rgb_ssim, AggregatedRangeDepthMetrics, ModalityMetrics,
-    RangeDepthMetrics,
+    AggregatedRangeDepthMetrics, ModalityMetrics, RangeDepthMetrics, aggregate_metrics,
+    aggregate_range_depth_metrics, compute_modality_metrics, compute_range_depth_metrics,
+    compute_rgb_ssim,
 };
 use sfx_train::{Embedding, RunInference, TrainingSummary};
 use std::collections::BTreeMap;
