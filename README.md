@@ -7,10 +7,10 @@ A research implementation of a multimodal autoencoder fusing RGB camera and LiDA
 - Trains separate range-only, RGB-only, and fusion autoencoders.
 - Uses a shared latent space for multimodal fusion with dual-modality reconstruction.
 - Produces deterministic processed splits from a fixed dataset config and uses seeded training batches.
-- Exposes an `xtask` CLI for setup, Google Cloud access, dataset listing/fetch/prepare/inspect/preview, model training, evaluation, comparison, export, and reporting.
+- Exposes an `xtask` CLI for setup, Google Cloud access, dataset listing/fetch/prepare/inspect/preview, model training, evaluation, comparison, compression benchmarking, export, and reporting.
 - Stores generated data, credentials, and run artifacts outside version control in `.xtask/`, `data/`, and `artifacts/`.
 
-> Note: `cargo xtask eval`, `compare`, `export`, and `report` load trained checkpoints through the `sfx-train` inference layer, so metrics, visualizations, comparisons, and reports reflect real `model.bin` reconstructions.
+> Note: `cargo xtask eval`, `compress-bench`, `compare`, `export`, and `report` load trained checkpoints through the `sfx-train` inference layer, so metrics, visualizations, comparisons, and reports reflect real `model.bin` reconstructions.
 
 ## Prerequisites
 
@@ -114,6 +114,30 @@ cargo xtask report --run artifacts/checkpoints/fusion/<run-id> --out artifacts/r
 
 Report generation writes `artifacts/reports/report.md` by default. The report includes training configuration, curves, final metrics, a `## Evaluation` section populated from `<run_dir>/eval/*.json`, and a `## Previews` section listing images under `<run_dir>/previews`.
 
+### 12. Run compression benchmark (AE vs codec anchors)
+
+```bash
+cargo xtask compress-bench --run artifacts/checkpoints/fusion/<run-id> --split val --config configs/bench.compression.toml
+```
+
+`compress-bench` writes one JSON + Markdown pair per selected split to `artifacts/bench/compression/` by default: `<split>.json` and `<split>.md`. With `--split all`, it emits `train.*`, `val.*`, and `test.*`.
+
+Key options:
+
+- `--run <path-or-run-id>`: run directory (or run id) to load `model.bin`; if omitted, uses `.xtask/runs/latest.json`.
+- `--split <all|train|val|test>`: overrides the split(s) from the config file.
+- `--config <path>`: compression benchmark config (default `configs/bench.compression.toml`).
+- Important overrides: `--out` (output directory), `--codecs` (codec/encoder list), `--crf` (applied to each selected codec), `--mode` (`independent` or `intra-sequence`), `--sample-cap`.
+
+Methodology + caveats:
+
+- **u8 reference domain**: headline AE and codec tables are computed in the packed 8-bit frame domain (not direct f32 tensor space). f32/depth context is retained in `ae_operating_points.*.notes` inside JSON output.
+- **Range handling**: range frames are packed as RGB24 `[depth, channel-2-or-0, 0]`; only the first one/two channels are used for compression-benchmark quality metrics. Physical depth metrics always use channel 0 (depth), with `max_range_meters` from `normalization.json` when available.
+- **Validity mask behavior**: depth metrics use a validity channel only when one is configured and still within the retained channels; otherwise valid pixels fall back to `depth_truth > 0`.
+- **Per-frame vs sequence mode**: `independent` encodes each sample independently; `intra-sequence` concatenates split samples into one stream per modality (RGB and range are still encoded separately and their bitrates are summed). `intra-sequence` does not inject GOP/all-intra constraints, so temporal prediction is codec-dependent.
+- **ffmpeg/encoder availability**: the command requires a working `ffmpeg` + encoder stack. Missing `ffmpeg` or unavailable encoders fail the run (no automatic codec skipping in `xtask compress-bench`).
+- **Interpretation boundary**: codec curves are reference anchors in this u8 packed domain, while AE points include model reconstruction effects; combined rows average modality summaries (RGB/range) and matched-quality rows should be treated as directional framing, not as a definitive “best codec” claim.
+
 ## Project Structure
 
 The repository is a Rust workspace with focused crates under `crates/`:
@@ -127,7 +151,7 @@ The repository is a Rust workspace with focused crates under `crates/`:
 - `sfx-train`: training loops, run directory management, checkpointing, inference, metrics, and previews
 - `sfx-eval`: evaluation-related building blocks used by the wider workspace
 - `sfx-tui`: terminal-oriented dataset exploration components
-- `xtask`: the operational CLI entry point for setup, data, auth, training, evaluation, export, comparison, and reporting tasks
+- `xtask`: the operational CLI entry point for setup, data, auth, training, evaluation, compression benchmarking, export, comparison, and reporting tasks
 
 See `docs/architecture.md` for the high-level crate map.
 
@@ -145,6 +169,7 @@ Configuration lives in `configs/`:
 - `train.debug.toml`: small fusion debug profile for fast smoke runs
 - `train.nextai.toml`: additional training profile kept alongside the main presets
 - `eval.default.toml`: evaluation configuration scaffold kept in the workspace for evaluation workflows
+- `bench.compression.toml`: compression benchmark sweep (codec list, CRF sweep, mode, split, quantization, and output directory)
 
 Key training parameters are grouped under `[train]` (`run_name`, `batch_size`, `learning_rate`, `epochs`, `seed`) and then reference dataset/model config files through `[dataset].config` and `[model].config`.
 
@@ -178,6 +203,7 @@ Local state is intentionally outside version control.
 
 - `artifacts/checkpoints/<range|rgb|fusion>/<run-id>/`: training summaries, metrics, checkpoints, optimizer metadata, and previews
 - `artifacts/previews/dataset/`: dataset grid previews from `dataset preview`
+- `artifacts/bench/compression/`: `compress-bench` split summaries (`<split>.json`, `<split>.md`)
 - `artifacts/metrics/`, `artifacts/reports/`, `artifacts/tui_exports/`: initialized output roots for additional artifact types
 
 ## Running Tests

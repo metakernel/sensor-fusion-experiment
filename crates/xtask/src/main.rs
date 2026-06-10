@@ -1,5 +1,6 @@
 mod bench;
 mod compare;
+mod compress_bench;
 mod dataset;
 mod eval;
 mod export;
@@ -39,6 +40,7 @@ enum Command {
     Eval(EvalArgs),
     Compare(CompareArgs),
     Bench(BenchArgs),
+    CompressBench(CompressBenchArgs),
     Export(ExportArgs),
     Report(ReportArgs),
     Tui(TuiArgs),
@@ -207,6 +209,26 @@ pub(crate) struct BenchArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct CompressBenchArgs {
+    #[arg(long)]
+    pub(crate) run: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) split: Option<String>,
+    #[arg(long, default_value = "configs/bench.compression.toml")]
+    pub(crate) config: PathBuf,
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) codecs: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) crf: Vec<u8>,
+    #[arg(long)]
+    pub(crate) mode: Option<String>,
+    #[arg(long)]
+    pub(crate) sample_cap: Option<usize>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ExportArgs {
     #[arg(long)]
     pub(crate) run: Option<PathBuf>,
@@ -308,6 +330,7 @@ fn main() -> Result<()> {
         Command::Eval(args) => eval::run(args, &paths),
         Command::Compare(args) => compare::run(args, &paths),
         Command::Bench(args) => bench::run(args, &paths),
+        Command::CompressBench(args) => compress_bench::run(args, &paths),
         Command::Export(args) => export::run(args, &paths),
         Command::Report(args) => report::run(args, &paths),
         Command::Tui(args) => tui::run(args, &paths),

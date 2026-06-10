@@ -23,6 +23,7 @@ pub struct RunInference {
     model: LoadedModel,
     device: Device<InnerBackend>,
     model_kind: ModelKind,
+    latent_dim: usize,
 }
 
 /// Contiguous NCHW reconstructions; Some only for modalities the model emits.
@@ -32,7 +33,7 @@ pub struct Reconstruction {
     pub range_hat: Option<Vec<f32>>,
 }
 
-/// Contiguous latent embeddings, one row per sample in the incoming batch.
+/// Contiguous latent embeddings, one row per sample; usable with reconstruct_from_latent.
 pub struct Embedding {
     pub sample_ids: Vec<String>,
     pub z: Vec<f32>,
@@ -91,11 +92,16 @@ impl RunInference {
             model,
             device,
             model_kind: kind,
+            latent_dim,
         })
     }
 
     pub fn model_kind(&self) -> ModelKind {
         self.model_kind
+    }
+
+    pub fn latent_dim(&self) -> usize {
+        self.latent_dim
     }
 
     /// Validates shapes, runs forward, returns per-sample-contiguous NCHW reconstructions.
@@ -190,6 +196,43 @@ impl RunInference {
         };
 
         Ok(Embedding { sample_ids, z, dim })
+    }
+
+    /// Validates latent shape, runs decoder path, returns per-sample-contiguous NCHW reconstructions.
+    pub fn reconstruct_from_latent(&self, embedding: &Embedding) -> Result<Reconstruction> {
+        if embedding.dim != self.latent_dim {
+            bail!(
+                "latent dim is {} but loaded model expects {}",
+                embedding.dim,
+                self.latent_dim
+            );
+        }
+
+        let batch_size = embedding.sample_ids.len();
+        ensure_len("latent", embedding.z.len(), batch_size * embedding.dim)?;
+
+        let z = Tensor::<InnerBackend, 2>::from_data(
+            TensorData::new(embedding.z.clone(), [batch_size, embedding.dim]),
+            &self.device,
+        );
+
+        let (rgb_hat, range_hat) = match &self.model {
+            LoadedModel::Range(model) => (None, Some(tensor_values(model.decode_latent(z))?)),
+            LoadedModel::Rgb(model) => (Some(tensor_values(model.decode_latent(z))?), None),
+            LoadedModel::Fusion(model) => {
+                let output = model.decode_shared_latent(z);
+                (
+                    Some(tensor_values(output.rgb_hat)?),
+                    Some(tensor_values(output.range_hat)?),
+                )
+            }
+        };
+
+        Ok(Reconstruction {
+            sample_ids: embedding.sample_ids.clone(),
+            rgb_hat,
+            range_hat,
+        })
     }
 }
 
@@ -335,6 +378,118 @@ mod tests {
         let infer = RunInference::load(&run_dir)?;
         let embedding = infer.embed(&batch)?;
         assert_embedding(&embedding, &batch, LATENT_DIM);
+        Ok(())
+    }
+
+    #[test]
+    fn reconstructs_fusion_from_latent_with_expected_shapes_and_is_deterministic() -> Result<()> {
+        let root = test_root("fusion-decode");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::Fusion, LATENT_DIM, Some(Z_MODALITY), true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        assert_eq!(infer.model_kind(), ModelKind::Fusion);
+        assert_eq!(infer.latent_dim(), LATENT_DIM);
+        let embedding = infer.embed(&batch)?;
+
+        let first = infer.reconstruct_from_latent(&embedding)?;
+        let second = infer.reconstruct_from_latent(&embedding)?;
+
+        assert_eq!(first.sample_ids, sample_id_strings(&batch));
+        assert_values(
+            first.rgb_hat.as_deref().expect("fusion emits rgb"),
+            batch.batch_size() * batch.rgb_shape.value_count(),
+        );
+        assert_values(
+            first.range_hat.as_deref().expect("fusion emits range"),
+            batch.batch_size() * batch.range_shape.value_count(),
+        );
+        assert_eq!(second.sample_ids, first.sample_ids);
+        assert_eq!(second.rgb_hat, first.rgb_hat);
+        assert_eq!(second.range_hat, first.range_hat);
+        Ok(())
+    }
+
+    #[test]
+    fn reconstructs_range_from_latent_with_expected_shape() -> Result<()> {
+        let root = test_root("range-decode");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::RangeOnly, LATENT_DIM, None, true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        assert_eq!(infer.model_kind(), ModelKind::RangeOnly);
+        let embedding = infer.embed(&batch)?;
+        let recon = infer.reconstruct_from_latent(&embedding)?;
+
+        assert_eq!(recon.sample_ids, sample_id_strings(&batch));
+        assert!(recon.rgb_hat.is_none());
+        assert_values(
+            recon.range_hat.as_deref().expect("range emits range"),
+            batch.batch_size() * batch.range_shape.value_count(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconstructs_rgb_from_latent_with_expected_shape() -> Result<()> {
+        let root = test_root("rgb-decode");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::RgbOnly, LATENT_DIM, None, true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        assert_eq!(infer.model_kind(), ModelKind::RgbOnly);
+        let embedding = infer.embed(&batch)?;
+        let recon = infer.reconstruct_from_latent(&embedding)?;
+
+        assert_eq!(recon.sample_ids, sample_id_strings(&batch));
+        assert!(recon.range_hat.is_none());
+        assert_values(
+            recon.rgb_hat.as_deref().expect("rgb emits rgb"),
+            batch.batch_size() * batch.rgb_shape.value_count(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruct_from_latent_rejects_unexpected_dim() -> Result<()> {
+        let root = test_root("decode-invalid-dim");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::Fusion, LATENT_DIM, Some(Z_MODALITY), true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        let invalid = Embedding {
+            sample_ids: sample_id_strings(&batch),
+            z: vec![0.0; batch.batch_size() * (LATENT_DIM + 1)],
+            dim: LATENT_DIM + 1,
+        };
+        let err = match infer.reconstruct_from_latent(&invalid) {
+            Ok(_) => panic!("expected latent dim mismatch"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("latent dim is 9 but loaded model expects 8")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruct_from_latent_rejects_wrong_value_count() -> Result<()> {
+        let root = test_root("decode-invalid-len");
+        let batch = full_size_batch(&root)?;
+        let run_dir = create_run(&root, ModelKind::Fusion, LATENT_DIM, Some(Z_MODALITY), true)?;
+
+        let infer = RunInference::load(&run_dir)?;
+        let invalid = Embedding {
+            sample_ids: sample_id_strings(&batch),
+            z: vec![0.0; batch.batch_size() * LATENT_DIM - 1],
+            dim: LATENT_DIM,
+        };
+        let err = match infer.reconstruct_from_latent(&invalid) {
+            Ok(_) => panic!("expected latent value-count mismatch"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("latent tensor has 15 values"));
         Ok(())
     }
 

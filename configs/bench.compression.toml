@@ -1,0 +1,18 @@
+[compression]
+codecs = ["libx264", "libx265", "libaom-av1"]
+split = "val"
+output_dir = "artifacts/bench/compression"
+mode = "independent"
+preset = "medium"
+sample_cap = 512
+
+[compression.crf_sweep]
+libx264 = [18, 23, 28, 33]
+libx265 = [20, 26, 32, 38]
+libaom-av1 = [24, 30, 36, 42]
+
+[compression.quantization]
+enabled = true
+strategy = "uniform"
+bits = 8
+per_channel = false

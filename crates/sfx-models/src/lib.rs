@@ -67,16 +67,9 @@ pub struct RangeAutoencoderOutput<B: Backend> {
 }
 
 impl<B: Backend> RangeAutoencoder<B> {
-    pub fn forward(&self, range: Tensor<B, 4>) -> RangeAutoencoderOutput<B> {
-        let x = relu(self.enc1.forward(range));
-        let x = relu(self.enc2.forward(x));
-        let x = relu(self.enc3.forward(x));
-
-        let [batch_size, _, _, _] = x.dims();
-        let x = x.reshape([batch_size, RANGE_ENCODED_VALUES]);
-        let z = self.to_latent.forward(x);
-
-        let x = relu(self.from_latent.forward(z.clone()));
+    pub fn decode_latent(&self, z: Tensor<B, 2>) -> Tensor<B, 4> {
+        let [batch_size, _] = z.dims();
+        let x = relu(self.from_latent.forward(z));
         let x = x.reshape([
             batch_size,
             ENCODED_CHANNELS,
@@ -85,7 +78,18 @@ impl<B: Backend> RangeAutoencoder<B> {
         ]);
         let x = relu(self.dec1.forward(x));
         let x = relu(self.dec2.forward(x));
-        let range_hat = sigmoid(self.dec3.forward(x));
+        sigmoid(self.dec3.forward(x))
+    }
+
+    pub fn forward(&self, range: Tensor<B, 4>) -> RangeAutoencoderOutput<B> {
+        let x = relu(self.enc1.forward(range));
+        let x = relu(self.enc2.forward(x));
+        let x = relu(self.enc3.forward(x));
+
+        let [batch_size, _, _, _] = x.dims();
+        let x = x.reshape([batch_size, RANGE_ENCODED_VALUES]);
+        let z = self.to_latent.forward(x);
+        let range_hat = self.decode_latent(z.clone());
 
         RangeAutoencoderOutput { range_hat, z }
     }
@@ -134,16 +138,9 @@ pub struct RgbAutoencoderOutput<B: Backend> {
 }
 
 impl<B: Backend> RgbAutoencoder<B> {
-    pub fn forward(&self, rgb: Tensor<B, 4>) -> RgbAutoencoderOutput<B> {
-        let x = relu(self.enc1.forward(rgb));
-        let x = relu(self.enc2.forward(x));
-        let x = relu(self.enc3.forward(x));
-
-        let [batch_size, _, _, _] = x.dims();
-        let x = x.reshape([batch_size, RGB_ENCODED_VALUES]);
-        let z = self.to_latent.forward(x);
-
-        let x = relu(self.from_latent.forward(z.clone()));
+    pub fn decode_latent(&self, z: Tensor<B, 2>) -> Tensor<B, 4> {
+        let [batch_size, _] = z.dims();
+        let x = relu(self.from_latent.forward(z));
         let x = x.reshape([
             batch_size,
             ENCODED_CHANNELS,
@@ -152,7 +149,18 @@ impl<B: Backend> RgbAutoencoder<B> {
         ]);
         let x = relu(self.dec1.forward(x));
         let x = relu(self.dec2.forward(x));
-        let rgb_hat = sigmoid(self.dec3.forward(x));
+        sigmoid(self.dec3.forward(x))
+    }
+
+    pub fn forward(&self, rgb: Tensor<B, 4>) -> RgbAutoencoderOutput<B> {
+        let x = relu(self.enc1.forward(rgb));
+        let x = relu(self.enc2.forward(x));
+        let x = relu(self.enc3.forward(x));
+
+        let [batch_size, _, _, _] = x.dims();
+        let x = x.reshape([batch_size, RGB_ENCODED_VALUES]);
+        let z = self.to_latent.forward(x);
+        let rgb_hat = self.decode_latent(z.clone());
 
         RgbAutoencoderOutput { rgb_hat, z }
     }
@@ -225,7 +233,41 @@ pub struct FusionOutput<B: Backend> {
     pub z_shared: Tensor<B, 2>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FusionReconstruction<B: Backend> {
+    pub rgb_hat: Tensor<B, 4>,
+    pub range_hat: Tensor<B, 4>,
+}
+
 impl<B: Backend> SharedLatentMultimodalAutoencoder<B> {
+    pub fn decode_shared_latent(&self, z_shared: Tensor<B, 2>) -> FusionReconstruction<B> {
+        let [batch_size, _] = z_shared.dims();
+
+        let rgb_decoded = relu(self.shared_to_rgb.forward(z_shared.clone()));
+        let rgb_decoded = rgb_decoded.reshape([
+            batch_size,
+            ENCODED_CHANNELS,
+            RGB_ENCODED_HEIGHT,
+            RGB_ENCODED_WIDTH,
+        ]);
+        let rgb_decoded = relu(self.rgb_dec1.forward(rgb_decoded));
+        let rgb_decoded = relu(self.rgb_dec2.forward(rgb_decoded));
+        let rgb_hat = sigmoid(self.rgb_dec3.forward(rgb_decoded));
+
+        let range_decoded = relu(self.shared_to_range.forward(z_shared));
+        let range_decoded = range_decoded.reshape([
+            batch_size,
+            ENCODED_CHANNELS,
+            RANGE_ENCODED_HEIGHT,
+            RANGE_ENCODED_WIDTH,
+        ]);
+        let range_decoded = relu(self.range_dec1.forward(range_decoded));
+        let range_decoded = relu(self.range_dec2.forward(range_decoded));
+        let range_hat = sigmoid(self.range_dec3.forward(range_decoded));
+
+        FusionReconstruction { rgb_hat, range_hat }
+    }
+
     pub fn forward(&self, rgb: Tensor<B, 4>, range: Tensor<B, 4>) -> FusionOutput<B> {
         let rgb_features = relu(self.rgb_enc1.forward(rgb));
         let rgb_features = relu(self.rgb_enc2.forward(rgb_features));
@@ -242,32 +284,11 @@ impl<B: Backend> SharedLatentMultimodalAutoencoder<B> {
 
         let fused = Tensor::cat(vec![z_rgb.clone(), z_range.clone()], 1);
         let z_shared = self.fusion_head.forward(fused);
-
-        let rgb_decoded = relu(self.shared_to_rgb.forward(z_shared.clone()));
-        let rgb_decoded = rgb_decoded.reshape([
-            batch_size,
-            ENCODED_CHANNELS,
-            RGB_ENCODED_HEIGHT,
-            RGB_ENCODED_WIDTH,
-        ]);
-        let rgb_decoded = relu(self.rgb_dec1.forward(rgb_decoded));
-        let rgb_decoded = relu(self.rgb_dec2.forward(rgb_decoded));
-        let rgb_hat = sigmoid(self.rgb_dec3.forward(rgb_decoded));
-
-        let range_decoded = relu(self.shared_to_range.forward(z_shared.clone()));
-        let range_decoded = range_decoded.reshape([
-            batch_size,
-            ENCODED_CHANNELS,
-            RANGE_ENCODED_HEIGHT,
-            RANGE_ENCODED_WIDTH,
-        ]);
-        let range_decoded = relu(self.range_dec1.forward(range_decoded));
-        let range_decoded = relu(self.range_dec2.forward(range_decoded));
-        let range_hat = sigmoid(self.range_dec3.forward(range_decoded));
+        let reconstruction = self.decode_shared_latent(z_shared.clone());
 
         FusionOutput {
-            rgb_hat,
-            range_hat,
+            rgb_hat: reconstruction.rgb_hat,
+            range_hat: reconstruction.range_hat,
             z_rgb,
             z_range,
             z_shared,
@@ -311,6 +332,20 @@ mod tests {
     }
 
     #[test]
+    fn range_autoencoder_decodes_latent_to_range_shape() {
+        let device = Default::default();
+        let model = RangeAutoencoderConfig::new(16).init::<Flex>(&device);
+        let z = Tensor::<Flex, 2>::zeros([2, 16], &device);
+
+        let range_hat = model.decode_latent(z);
+
+        assert_eq!(
+            range_hat.dims(),
+            [2, RANGE_CHANNELS, RANGE_HEIGHT, RANGE_WIDTH]
+        );
+    }
+
+    #[test]
     fn rgb_autoencoder_preserves_rgb_shape() {
         let device = Default::default();
         let model = RgbAutoencoderConfig::new(16).init::<Flex>(&device);
@@ -323,6 +358,17 @@ mod tests {
             [2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH]
         );
         assert_eq!(output.z.dims(), [2, 16]);
+    }
+
+    #[test]
+    fn rgb_autoencoder_decodes_latent_to_rgb_shape() {
+        let device = Default::default();
+        let model = RgbAutoencoderConfig::new(16).init::<Flex>(&device);
+        let z = Tensor::<Flex, 2>::zeros([2, 16], &device);
+
+        let rgb_hat = model.decode_latent(z);
+
+        assert_eq!(rgb_hat.dims(), [2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH]);
     }
 
     #[test]
@@ -346,5 +392,23 @@ mod tests {
         assert_eq!(output.z_rgb.dims(), [2, 32]);
         assert_eq!(output.z_range.dims(), [2, 32]);
         assert_eq!(output.z_shared.dims(), [2, 16]);
+    }
+
+    #[test]
+    fn shared_latent_autoencoder_decodes_shared_latent_to_both_modalities() {
+        let device = Default::default();
+        let model = SharedLatentMultimodalAutoencoderConfig::new(16, 32).init::<Flex>(&device);
+        let z_shared = Tensor::<Flex, 2>::zeros([2, 16], &device);
+
+        let reconstruction = model.decode_shared_latent(z_shared);
+
+        assert_eq!(
+            reconstruction.rgb_hat.dims(),
+            [2, RGB_CHANNELS, RGB_HEIGHT, RGB_WIDTH]
+        );
+        assert_eq!(
+            reconstruction.range_hat.dims(),
+            [2, RANGE_CHANNELS, RANGE_HEIGHT, RANGE_WIDTH]
+        );
     }
 }
